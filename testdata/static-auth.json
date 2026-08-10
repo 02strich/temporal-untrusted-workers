@@ -1,0 +1,14 @@
+{
+  "keys": {
+    "testkey123": {
+      "namespace": "default",
+      "task_queue": "proxy-test-queue",
+      "subject": "worker-fleet-a"
+    },
+    "testkey-wrong-queue": {
+      "namespace": "default",
+      "task_queue": "other-queue",
+      "subject": "worker-fleet-b"
+    }
+  }
+}
