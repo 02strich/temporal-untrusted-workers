@@ -15,7 +15,7 @@ func TestApiKeyInterceptor_AttachesAuthorizationHeader(t *testing.T) {
 	interceptor := apiKeyInterceptor("upstream-secret")
 
 	var seenMD metadata.MD
-	invoker := func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
+	invoker := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
 		seenMD, _ = metadata.FromOutgoingContext(ctx)
 		return nil
 	}
@@ -42,7 +42,7 @@ func TestApiKeyInterceptor_DoesNotLeakDownstreamMetadata(t *testing.T) {
 	interceptor := apiKeyInterceptor("upstream-secret")
 
 	var seenMD metadata.MD
-	invoker := func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
+	invoker := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
 		seenMD, _ = metadata.FromOutgoingContext(ctx)
 		return nil
 	}

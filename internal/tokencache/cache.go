@@ -131,10 +131,7 @@ type Cache struct {
 // approximate global size cap (enforced per-shard via LRU eviction, so the
 // effective cap is maxSize rounded up to a multiple of the shard count).
 func New(ttl time.Duration, maxSize int) *Cache {
-	perShard := maxSize / numShards
-	if perShard < 1 {
-		perShard = 1
-	}
+	perShard := max(maxSize/numShards, 1)
 
 	c := &Cache{
 		ttl:         ttl,
@@ -145,10 +142,7 @@ func New(ttl time.Duration, maxSize int) *Cache {
 		c.shards[i] = newShard(perShard)
 	}
 
-	interval := ttl / 4
-	if interval < 15*time.Second {
-		interval = 15 * time.Second
-	}
+	interval := max(ttl/4, 15*time.Second)
 	go c.runJanitor(interval)
 
 	return c

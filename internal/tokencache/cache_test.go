@@ -68,7 +68,7 @@ func TestCache_GetSlidesTTLForward(t *testing.T) {
 	// Heartbeat every 60ms, well under the 100ms TTL, for longer than the
 	// original TTL would have allowed - simulates an actively heartbeating
 	// long-running activity.
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		time.Sleep(60 * time.Millisecond)
 		if _, ok := c.Get(token); !ok {
 			t.Fatalf("expected token to still be live at iteration %d", i)
@@ -84,8 +84,8 @@ func TestCache_LRUEvictionUnderShardCap(t *testing.T) {
 	c := New(time.Hour, numShards) // ~1 per shard
 	defer c.Close()
 
-	for i := 0; i < 10000; i++ {
-		token := []byte(fmt.Sprintf("token-%d", i))
+	for i := range 10000 {
+		token := fmt.Appendf(nil, "token-%d", i)
 		c.Put(token, Entry{Namespace: "ns", TaskQueue: "queue-a"})
 	}
 

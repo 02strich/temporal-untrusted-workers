@@ -74,7 +74,7 @@ func transportCredentials(cfg config.UpstreamConfig) (credentials.TransportCrede
 // Bearer <key>" entry). The key is read once, at dial time, since it is
 // static for the proxy's lifetime.
 func apiKeyInterceptor(apiKey string) grpc.UnaryClientInterceptor {
-	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+apiKey)
 		return invoker(ctx, method, req, reply, cc, opts...)
 	}

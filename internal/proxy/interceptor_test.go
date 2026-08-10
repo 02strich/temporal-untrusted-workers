@@ -39,10 +39,10 @@ func ctxWithBearer(key string) context.Context {
 	return metadata.NewIncomingContext(context.Background(), md)
 }
 
-func callInterceptor(t *testing.T, interceptor grpc.UnaryServerInterceptor, ctx context.Context, fullMethod string, req interface{}, resp interface{}, handlerErr error) (interface{}, error, bool) {
+func callInterceptor(t *testing.T, interceptor grpc.UnaryServerInterceptor, ctx context.Context, fullMethod string, req any, resp any, handlerErr error) (any, error, bool) {
 	t.Helper()
 	handlerCalled := false
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		handlerCalled = true
 		return resp, handlerErr
 	}
@@ -698,7 +698,7 @@ func TestInterceptor_DoesNotLeakIdentityIntoOutgoingMetadata(t *testing.T) {
 	interceptor := NewInterceptor(authr, cache)
 
 	var sawOutgoing bool
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		_, sawOutgoing = metadata.FromOutgoingContext(ctx)
 		id, ok := IdentityFromContext(ctx)
 		if !ok || id.Subject != "worker-fleet-a" {
