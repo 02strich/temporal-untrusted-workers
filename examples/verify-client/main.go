@@ -13,6 +13,7 @@ import (
 	"os"
 	"time"
 
+	enumsv1 "go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/client"
 )
 
@@ -30,7 +31,7 @@ func main() {
 	}
 	defer c.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
@@ -46,6 +47,49 @@ func main() {
 		log.Fatalf("workflow failed: %v", err)
 	}
 	log.Printf("workflow result: %q", result)
+
+	verifyCrossQueueBlocked(ctx, c, taskQueue)
+}
+
+// verifyCrossQueueBlocked starts CrossQueueWorkflow, whose activity targets
+// "forbidden-queue" - a task queue no configured identity is authorized
+// for. The proxy denies the RespondWorkflowTaskCompleted call carrying that
+// command, so the workflow can never actually complete (its workflow task
+// will keep timing out and being rescheduled). This checks that the
+// activity was indeed never scheduled, then terminates the workflow so it
+// doesn't retry forever against the dev server.
+func verifyCrossQueueBlocked(ctx context.Context, c client.Client, taskQueue string) {
+	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+		ID:        fmt.Sprintf("verify-cross-queue-%d", time.Now().UnixNano()),
+		TaskQueue: taskQueue,
+	}, "CrossQueueWorkflow", "hello from verify-client")
+	if err != nil {
+		log.Fatalf("starting CrossQueueWorkflow: %v", err)
+	}
+
+	log.Println("started CrossQueueWorkflow (its activity targets \"forbidden-queue\", which the proxy should block)")
+	time.Sleep(5 * time.Second)
+
+	scheduledActivity := false
+	iter := c.GetWorkflowHistory(ctx, run.GetID(), run.GetRunID(), false, enumsv1.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT)
+	for iter.HasNext() {
+		event, err := iter.Next()
+		if err != nil {
+			log.Fatalf("reading CrossQueueWorkflow history: %v", err)
+		}
+		if event.GetEventType() == enumsv1.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED {
+			scheduledActivity = true
+		}
+	}
+
+	if err := c.TerminateWorkflow(ctx, run.GetID(), run.GetRunID(), "verify-client: cross-queue command correctly blocked, cleaning up"); err != nil {
+		log.Printf("warning: failed to terminate CrossQueueWorkflow: %v", err)
+	}
+
+	if scheduledActivity {
+		log.Fatal("CrossQueueWorkflow: activity was scheduled on forbidden-queue - the proxy should have blocked this")
+	}
+	log.Println("confirmed: CrossQueueWorkflow's forbidden-queue activity command was blocked by the proxy (no ActivityTaskScheduled event)")
 }
 
 func getEnv(key, def string) string {

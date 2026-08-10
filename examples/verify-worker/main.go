@@ -41,6 +41,22 @@ func EchoActivity(_ context.Context, msg string) (string, error) {
 	return msg, nil
 }
 
+// CrossQueueWorkflow schedules EchoActivity on "forbidden-queue" - a task
+// queue that belongs to no configured identity in testdata/static-auth.json.
+// The proxy must deny the RespondWorkflowTaskCompleted call carrying this
+// command (see internal/scope.ValidateCommands), so this workflow never
+// actually completes; it exists purely to make that denial observable when
+// running the example.
+func CrossQueueWorkflow(ctx workflow.Context, msg string) (string, error) {
+	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		TaskQueue:           "forbidden-queue",
+		StartToCloseTimeout: time.Minute,
+	})
+	var result string
+	err := workflow.ExecuteActivity(ctx, EchoActivity, msg).Get(ctx, &result)
+	return result, err
+}
+
 func main() {
 	proxyAddr := getEnv("VERIFY_PROXY_ADDR", "127.0.0.1:7243")
 	namespace := getEnv("VERIFY_NAMESPACE", "default")
@@ -65,6 +81,7 @@ func main() {
 
 	w := worker.New(c, taskQueue, worker.Options{})
 	w.RegisterWorkflow(EchoWorkflow)
+	w.RegisterWorkflow(CrossQueueWorkflow)
 	w.RegisterActivity(EchoActivity)
 
 	log.Printf("verify-worker starting: proxy=%s namespace=%s taskQueue=%s", proxyAddr, namespace, taskQueue)
