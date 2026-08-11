@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/02strich/temporal-untrusted-workers/internal/actions"
 	"github.com/02strich/temporal-untrusted-workers/internal/auth"
 	"github.com/02strich/temporal-untrusted-workers/internal/rpcpolicy"
 	"github.com/02strich/temporal-untrusted-workers/internal/scope"
@@ -88,6 +89,19 @@ func NewInterceptor(authenticator auth.Authenticator, cache *tokencache.Cache) g
 			for _, token := range scope.CollectResponseTaskTokens(protoResp) {
 				cache.Put(token, tokencache.Entry{Namespace: identity.Namespace, TaskQueue: identity.TaskQueue})
 			}
+		}
+
+		// Log the billable Temporal Cloud actions this call consumed, one line
+		// per command, attributed to the calling identity. Runs only on
+		// success, so a call the upstream rejected records no action.
+		for _, a := range actions.FromRequest(protoReq) {
+			slog.Info("cloud action consumed",
+				"action", a.Type,
+				"actions", a.Count,
+				"rpc", rpcName,
+				"namespace", identity.Namespace,
+				"task_queue", identity.TaskQueue,
+				"subject", identity.Subject)
 		}
 
 		return resp, nil

@@ -1,8 +1,11 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -15,6 +18,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"github.com/02strich/temporal-untrusted-workers/internal/actions"
 	"github.com/02strich/temporal-untrusted-workers/internal/auth"
 	"github.com/02strich/temporal-untrusted-workers/internal/tokencache"
 )
@@ -492,6 +496,109 @@ func TestInterceptor_GetSystemInfoNeedsOnlyValidIdentity(t *testing.T) {
 
 	if !called || err != nil {
 		t.Fatalf("expected successful call, called=%v err=%v", called, err)
+	}
+}
+
+// captureLogs swaps the default slog logger for a JSON handler writing to buf
+// for the duration of the test, restoring the original afterward.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+	return buf
+}
+
+// logLinesWithMsg parses buf as newline-delimited JSON log records and returns
+// those whose "msg" equals msg.
+func logLinesWithMsg(t *testing.T, buf *bytes.Buffer, msg string) []map[string]any {
+	t.Helper()
+	var matched []map[string]any
+	for _, line := range bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal(line, &entry); err != nil {
+			t.Fatalf("parsing log line %q: %v", line, err)
+		}
+		if entry["msg"] == msg {
+			matched = append(matched, entry)
+		}
+	}
+	return matched
+}
+
+func TestInterceptor_LogsCloudActionPerBillableCommand(t *testing.T) {
+	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
+		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a", Subject: "worker-a"},
+	}}
+	cache := tokencache.New(time.Hour, 1000)
+	defer cache.Close()
+	interceptor := NewInterceptor(authr, cache)
+	cache.Put([]byte("wt-tok"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
+
+	buf := captureLogs(t)
+
+	req := &workflowservice.RespondWorkflowTaskCompletedRequest{
+		Namespace: "ns",
+		TaskToken: []byte("wt-tok"),
+		Commands: []*commandpb.Command{
+			{Attributes: &commandpb.Command_ScheduleActivityTaskCommandAttributes{
+				ScheduleActivityTaskCommandAttributes: &commandpb.ScheduleActivityTaskCommandAttributes{
+					TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-a"},
+				},
+			}},
+			// Not billable - must not produce a line.
+			{Attributes: &commandpb.Command_CompleteWorkflowExecutionCommandAttributes{}},
+		},
+	}
+
+	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
+		"/temporal.api.workflowservice.v1.WorkflowService/RespondWorkflowTaskCompleted",
+		req, &workflowservice.RespondWorkflowTaskCompletedResponse{}, nil)
+	if !called || err != nil {
+		t.Fatalf("expected successful call, called=%v err=%v", called, err)
+	}
+
+	lines := logLinesWithMsg(t, buf, "cloud action consumed")
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 cloud action line, got %d: %s", len(lines), buf.String())
+	}
+	got := lines[0]
+	if got["action"] != actions.ScheduleActivity {
+		t.Fatalf("action = %v, want %q", got["action"], actions.ScheduleActivity)
+	}
+	// JSON numbers decode as float64.
+	if got["actions"] != float64(1) {
+		t.Fatalf("actions = %v, want 1", got["actions"])
+	}
+	if got["namespace"] != "ns" || got["task_queue"] != "queue-a" || got["subject"] != "worker-a" {
+		t.Fatalf("identity fields wrong: %+v", got)
+	}
+}
+
+func TestInterceptor_PollEmitsNoCloudAction(t *testing.T) {
+	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
+		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+	}}
+	cache := tokencache.New(time.Hour, 1000)
+	defer cache.Close()
+	interceptor := NewInterceptor(authr, cache)
+
+	buf := captureLogs(t)
+
+	req := &workflowservice.PollWorkflowTaskQueueRequest{Namespace: "ns", TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-a"}}
+	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
+		"/temporal.api.workflowservice.v1.WorkflowService/PollWorkflowTaskQueue",
+		req, &workflowservice.PollWorkflowTaskQueueResponse{}, nil)
+	if !called || err != nil {
+		t.Fatalf("expected successful poll, called=%v err=%v", called, err)
+	}
+
+	if lines := logLinesWithMsg(t, buf, "cloud action consumed"); len(lines) != 0 {
+		t.Fatalf("expected no cloud action lines for a poll, got %d: %s", len(lines), buf.String())
 	}
 }
 
