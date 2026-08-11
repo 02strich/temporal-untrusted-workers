@@ -23,6 +23,8 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
+
+	"github.com/02strich/temporal-untrusted-workers/examples/internal/verifytls"
 )
 
 // EchoWorkflow runs EchoActivity and returns its result unchanged. It
@@ -66,13 +68,19 @@ func main() {
 		log.Fatal("VERIFY_API_KEY is required")
 	}
 
+	// Plaintext by default (matching the proxy's local-dev default); set
+	// VERIFY_TLS_MODE=tls to connect to a proxy whose downstream listener
+	// terminates TLS.
+	connOpts, err := verifytls.ConnectionOptions()
+	if err != nil {
+		log.Fatalf("configuring TLS: %v", err)
+	}
+
 	c, err := client.Dial(client.Options{
-		HostPort:    proxyAddr,
-		Namespace:   namespace,
-		Credentials: client.NewAPIKeyStaticCredentials(apiKey),
-		// No TLS configured: the API-key credential does not force TLS on
-		// this SDK version, and the proxy defaults to plaintext for local
-		// dev anyway.
+		HostPort:          proxyAddr,
+		Namespace:         namespace,
+		Credentials:       client.NewAPIKeyStaticCredentials(apiKey),
+		ConnectionOptions: connOpts,
 	})
 	if err != nil {
 		log.Fatalf("creating client: %v", err)

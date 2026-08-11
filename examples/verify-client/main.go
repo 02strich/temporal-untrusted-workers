@@ -15,6 +15,8 @@ import (
 
 	enumsv1 "go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/client"
+
+	"github.com/02strich/temporal-untrusted-workers/examples/internal/verifytls"
 )
 
 func main() {
@@ -22,9 +24,17 @@ func main() {
 	namespace := getEnv("VERIFY_NAMESPACE", "default")
 	taskQueue := getEnv("VERIFY_TASK_QUEUE", "proxy-test-queue")
 
+	// Plaintext by default for a local dev server; set VERIFY_TLS_MODE=tls to
+	// connect to a TLS upstream such as Temporal Cloud.
+	connOpts, err := verifytls.ConnectionOptions()
+	if err != nil {
+		log.Fatalf("configuring TLS: %v", err)
+	}
+
 	c, err := client.Dial(client.Options{
-		HostPort:  upstreamAddr,
-		Namespace: namespace,
+		HostPort:          upstreamAddr,
+		Namespace:         namespace,
+		ConnectionOptions: connOpts,
 	})
 	if err != nil {
 		log.Fatalf("creating client: %v", err)
