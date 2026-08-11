@@ -41,6 +41,9 @@ func TestRequestNamespace(t *testing.T) {
 	if ns, ok := RequestNamespace(&workflowservice.DescribeNamespaceRequest{Namespace: "ns-a"}); !ok || ns != "ns-a" {
 		t.Fatalf("DescribeNamespaceRequest: got (%q, %v)", ns, ok)
 	}
+	if ns, ok := RequestNamespace(&workflowservice.ShutdownWorkerRequest{Namespace: "ns-a"}); !ok || ns != "ns-a" {
+		t.Fatalf("ShutdownWorkerRequest: got (%q, %v)", ns, ok)
+	}
 
 	if _, ok := RequestNamespace(&workflowservice.GetSystemInfoRequest{}); ok {
 		t.Fatalf("GetSystemInfoRequest should not have a namespace")
@@ -65,6 +68,15 @@ func TestRequestTaskQueueName(t *testing.T) {
 	}
 	if tq, ok := RequestTaskQueueName(act); !ok || tq != "queue-a" {
 		t.Fatalf("got (%q, %v)", tq, ok)
+	}
+
+	// ShutdownWorker carries the normal queue name directly as a string.
+	if tq, ok := RequestTaskQueueName(&workflowservice.ShutdownWorkerRequest{TaskQueue: "queue-a"}); !ok || tq != "queue-a" {
+		t.Fatalf("ShutdownWorkerRequest: got (%q, %v)", tq, ok)
+	}
+	// An empty task queue is legitimate for ShutdownWorker; ok must still be true.
+	if tq, ok := RequestTaskQueueName(&workflowservice.ShutdownWorkerRequest{}); !ok || tq != "" {
+		t.Fatalf("ShutdownWorkerRequest with no queue: got (%q, %v)", tq, ok)
 	}
 
 	if _, ok := RequestTaskQueueName(&workflowservice.RespondActivityTaskCompletedRequest{}); ok {

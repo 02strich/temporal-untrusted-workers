@@ -182,6 +182,19 @@ func authorizeRequest(req proto.Message, rpcName string, policy rpcpolicy.Policy
 		if ns != identity.Namespace {
 			return fmt.Errorf("namespace %q not authorized for this identity", ns)
 		}
+
+	case rpcpolicy.CategoryWorker:
+		ns, _ := scope.RequestNamespace(req)
+		if ns != identity.Namespace {
+			return fmt.Errorf("namespace %q not authorized for this identity", ns)
+		}
+		// The normal task-queue name is optional here; when present it must
+		// match the caller's queue so a worker can't cancel another queue's
+		// outstanding polls within the namespace. The unguessable sticky queue
+		// name (if any) needs no check, mirroring the sticky Poll case.
+		if tq, ok := scope.RequestTaskQueueName(req); ok && tq != "" && tq != identity.TaskQueue {
+			return fmt.Errorf("task queue %q not authorized for this identity", tq)
+		}
 	}
 
 	if rpcName == "RespondWorkflowTaskCompleted" {

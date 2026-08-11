@@ -138,6 +138,72 @@ func TestInterceptor_PollAllowsMatchingQueue(t *testing.T) {
 	}
 }
 
+const shutdownWorkerMethod = "/temporal.api.workflowservice.v1.WorkflowService/ShutdownWorker"
+
+func shutdownInterceptor(t *testing.T) grpc.UnaryServerInterceptor {
+	t.Helper()
+	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
+		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+	}}
+	cache := tokencache.New(time.Hour, 1000)
+	t.Cleanup(cache.Close)
+	return NewInterceptor(authr, cache)
+}
+
+func TestInterceptor_ShutdownWorkerAllowsMatchingQueue(t *testing.T) {
+	req := &workflowservice.ShutdownWorkerRequest{Namespace: "ns", TaskQueue: "queue-a", StickyTaskQueue: "host:random-uuid"}
+	_, err, called := callInterceptor(t, shutdownInterceptor(t), ctxWithBearer("key-a"),
+		shutdownWorkerMethod, req, &workflowservice.ShutdownWorkerResponse{}, nil)
+
+	if !called {
+		t.Fatalf("handler should have run for an authorized ShutdownWorker")
+	}
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestInterceptor_ShutdownWorkerAllowsEmptyQueue(t *testing.T) {
+	// The normal task queue is optional; only the sticky queue is populated.
+	req := &workflowservice.ShutdownWorkerRequest{Namespace: "ns", StickyTaskQueue: "host:random-uuid"}
+	_, err, called := callInterceptor(t, shutdownInterceptor(t), ctxWithBearer("key-a"),
+		shutdownWorkerMethod, req, &workflowservice.ShutdownWorkerResponse{}, nil)
+
+	if !called {
+		t.Fatalf("handler should have run for a ShutdownWorker with no normal queue")
+	}
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestInterceptor_ShutdownWorkerDeniesOtherQueue(t *testing.T) {
+	// A worker must not be able to cancel another queue's outstanding polls.
+	req := &workflowservice.ShutdownWorkerRequest{Namespace: "ns", TaskQueue: "victim-queue"}
+	_, err, called := callInterceptor(t, shutdownInterceptor(t), ctxWithBearer("key-a"),
+		shutdownWorkerMethod, req, &workflowservice.ShutdownWorkerResponse{}, nil)
+
+	if called {
+		t.Fatalf("handler must not run for a ShutdownWorker targeting another queue")
+	}
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied, got %v", err)
+	}
+}
+
+func TestInterceptor_ShutdownWorkerDeniesOtherNamespace(t *testing.T) {
+	req := &workflowservice.ShutdownWorkerRequest{Namespace: "other-ns", TaskQueue: "queue-a"}
+	_, err, called := callInterceptor(t, shutdownInterceptor(t), ctxWithBearer("key-a"),
+		shutdownWorkerMethod, req, &workflowservice.ShutdownWorkerResponse{}, nil)
+
+	if called {
+		t.Fatalf("handler must not run for a ShutdownWorker in another namespace")
+	}
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied, got %v", err)
+	}
+}
+
 func TestInterceptor_PollDeniesWrongQueue(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
 		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},

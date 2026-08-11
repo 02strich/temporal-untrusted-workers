@@ -63,3 +63,7 @@ func (s *Server) GetSystemInfo(ctx context.Context, req *workflowservice.GetSyst
 func (s *Server) DescribeNamespace(ctx context.Context, req *workflowservice.DescribeNamespaceRequest) (*workflowservice.DescribeNamespaceResponse, error) {
 	return s.Upstream.DescribeNamespace(ctx, req)
 }
+
+func (s *Server) ShutdownWorker(ctx context.Context, req *workflowservice.ShutdownWorkerRequest) (*workflowservice.ShutdownWorkerResponse, error) {
+	return s.Upstream.ShutdownWorker(ctx, req)
+}

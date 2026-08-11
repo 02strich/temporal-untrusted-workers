@@ -43,19 +43,26 @@ func RequestNamespace(req proto.Message) (string, bool) {
 		return r.GetNamespace(), true
 	case *workflowservice.DescribeNamespaceRequest:
 		return r.GetNamespace(), true
+	case *workflowservice.ShutdownWorkerRequest:
+		return r.GetNamespace(), true
 	default:
 		return "", false
 	}
 }
 
 // RequestTaskQueueName returns the task queue name carried by a request of
-// one of the two Poll RPCs.
+// one of the two Poll RPCs or of ShutdownWorker. ShutdownWorker carries the
+// normal queue name directly as a string (not a TaskQueue message), and that
+// name may legitimately be empty - the second return value reports only that
+// the RPC has such a field, not that it is set.
 func RequestTaskQueueName(req proto.Message) (string, bool) {
 	switch r := req.(type) {
 	case *workflowservice.PollWorkflowTaskQueueRequest:
 		return r.GetTaskQueue().GetName(), true
 	case *workflowservice.PollActivityTaskQueueRequest:
 		return r.GetTaskQueue().GetName(), true
+	case *workflowservice.ShutdownWorkerRequest:
+		return r.GetTaskQueue(), true
 	default:
 		return "", false
 	}

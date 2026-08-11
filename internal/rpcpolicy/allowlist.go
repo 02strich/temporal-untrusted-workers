@@ -19,6 +19,11 @@ const (
 	// CategoryNamespaceOnly requests carry an explicit namespace but no task
 	// queue or task token.
 	CategoryNamespaceOnly
+	// CategoryWorker requests carry an explicit namespace and the normal task
+	// queue name as a plain string (which may be empty). When the name is set
+	// it must match the caller's authorized queue; any sticky queue name they
+	// also carry is a per-worker unguessable identifier and is not checked.
+	CategoryWorker
 )
 
 // Policy describes how the proxy should treat one allowed RPC.
@@ -66,4 +71,11 @@ var Allowed = map[string]Policy{
 	// even start. It is read-only and carries no task queue, so it is scoped
 	// to the caller's namespace only.
 	"DescribeNamespace": {Category: CategoryNamespaceOnly},
+	// ShutdownWorker is sent by an SDK worker as it stops, so the server can
+	// cancel that worker's outstanding poll RPCs and update its heartbeat
+	// state instead of waiting for timeouts. It carries the caller's namespace
+	// and (optionally) the normal task queue it polls; both are scoped to the
+	// caller's identity so a worker can't cancel another queue's polls. It has
+	// no task token, so it is not terminal.
+	"ShutdownWorker": {Category: CategoryWorker},
 }
