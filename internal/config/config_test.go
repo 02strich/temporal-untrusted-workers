@@ -27,6 +27,49 @@ func TestLoad_Defaults(t *testing.T) {
 		if cfg.Upstream.AuthMode != AuthModeNone {
 			t.Fatalf("unexpected default auth mode: %s", cfg.Upstream.AuthMode)
 		}
+		if cfg.WorkerAuthMode != WorkerAuthModeStatic {
+			t.Fatalf("unexpected default worker auth mode: %s", cfg.WorkerAuthMode)
+		}
+	})
+}
+
+func TestLoad_JWTModeRequiresAudience(t *testing.T) {
+	withEnv(t, map[string]string{
+		"TEMPORAL_PROXY_STATIC_AUTH_FILE": "/tmp/does-not-need-to-exist.json",
+		"TEMPORAL_PROXY_AUTH_MODE":        WorkerAuthModeJWT,
+	}, func() {
+		_, err := Load()
+		if err == nil {
+			t.Fatalf("expected error when jwt mode is set without TEMPORAL_PROXY_JWT_AUDIENCE")
+		}
+	})
+}
+
+func TestLoad_JWTModeWithAudience(t *testing.T) {
+	withEnv(t, map[string]string{
+		"TEMPORAL_PROXY_STATIC_AUTH_FILE": "/tmp/does-not-need-to-exist.json",
+		"TEMPORAL_PROXY_AUTH_MODE":        WorkerAuthModeJWT,
+		"TEMPORAL_PROXY_JWT_AUDIENCE":     "https://proxy.example.com",
+	}, func() {
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerAuthMode != WorkerAuthModeJWT || cfg.JWTAudience != "https://proxy.example.com" {
+			t.Fatalf("unexpected jwt config: mode=%s audience=%s", cfg.WorkerAuthMode, cfg.JWTAudience)
+		}
+	})
+}
+
+func TestLoad_InvalidWorkerAuthMode(t *testing.T) {
+	withEnv(t, map[string]string{
+		"TEMPORAL_PROXY_STATIC_AUTH_FILE": "/tmp/does-not-need-to-exist.json",
+		"TEMPORAL_PROXY_AUTH_MODE":        "bogus",
+	}, func() {
+		_, err := Load()
+		if err == nil {
+			t.Fatalf("expected error for invalid worker auth mode")
+		}
 	})
 }
 

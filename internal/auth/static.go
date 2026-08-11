@@ -16,15 +16,57 @@ type staticKeyEntry struct {
 	Subject   string `json:"subject"`
 }
 
-// staticConfig is the JSON shape of a static auth file:
+// authFileConfig is the JSON shape of the unified auth file. "keys" maps raw
+// API keys to their settings (used by StaticAuthenticator); "emails" maps
+// verified email addresses to the same settings (used by JWTAuthenticator).
+// Both sections are optional, and a deployment uses only the one that matches
+// its configured auth mode.
 //
 //	{
-//	  "keys": {
-//	    "wk_live_abc123...": {"namespace": "default", "task_queue": "my-task-queue", "subject": "worker-fleet-a"}
-//	  }
+//	  "keys":   {"wk_live_abc123...":        {"namespace": "default", "task_queue": "my-task-queue", "subject": "worker-fleet-a"}},
+//	  "emails": {"sa@project.iam.gserviceaccount.com": {"namespace": "default", "task_queue": "my-task-queue", "subject": "worker-fleet-a"}}
 //	}
-type staticConfig struct {
-	Keys map[string]staticKeyEntry `json:"keys"`
+type authFileConfig struct {
+	Keys   map[string]staticKeyEntry `json:"keys"`
+	Emails map[string]staticKeyEntry `json:"emails"`
+}
+
+// loadAuthFile reads and parses the unified auth file at path.
+func loadAuthFile(path string) (authFileConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return authFileConfig{}, fmt.Errorf("auth: reading auth file: %w", err)
+	}
+
+	var cfg authFileConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return authFileConfig{}, fmt.Errorf("auth: parsing auth file: %w", err)
+	}
+	return cfg, nil
+}
+
+// buildIdentities turns a section of auth-file entries into resolved
+// Identities. The returned map is keyed by sha256(lookupKey) hex when hash is
+// true (for secret API keys, so raw keys aren't resident as map keys) and by
+// the raw lookup key otherwise (for non-secret email addresses).
+func buildIdentities(entries map[string]staticKeyEntry, hash bool) (map[string]Identity, error) {
+	identities := make(map[string]Identity, len(entries))
+	for lookupKey, entry := range entries {
+		if entry.Namespace == "" || entry.TaskQueue == "" {
+			return nil, fmt.Errorf("auth: auth file: entry %q is missing namespace or task_queue", lookupKey)
+		}
+		mapKey := lookupKey
+		if hash {
+			mapKey = hashKey(lookupKey)
+		}
+		identities[mapKey] = Identity{
+			Valid:     true,
+			Namespace: entry.Namespace,
+			TaskQueue: entry.TaskQueue,
+			Subject:   entry.Subject,
+		}
+	}
+	return identities, nil
 }
 
 // StaticAuthenticator authenticates API keys against a fixed, file-loaded
@@ -37,29 +79,17 @@ type StaticAuthenticator struct {
 	identities map[string]Identity
 }
 
-// NewStaticAuthenticatorFromFile loads a static auth JSON file.
+// NewStaticAuthenticatorFromFile loads the "keys" section of the unified auth
+// JSON file.
 func NewStaticAuthenticatorFromFile(path string) (*StaticAuthenticator, error) {
-	data, err := os.ReadFile(path)
+	cfg, err := loadAuthFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("auth: reading static auth file: %w", err)
+		return nil, err
 	}
 
-	var cfg staticConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("auth: parsing static auth file: %w", err)
-	}
-
-	identities := make(map[string]Identity, len(cfg.Keys))
-	for key, entry := range cfg.Keys {
-		if entry.Namespace == "" || entry.TaskQueue == "" {
-			return nil, fmt.Errorf("auth: static auth file: entry for a key is missing namespace or task_queue")
-		}
-		identities[hashKey(key)] = Identity{
-			Valid:     true,
-			Namespace: entry.Namespace,
-			TaskQueue: entry.TaskQueue,
-			Subject:   entry.Subject,
-		}
+	identities, err := buildIdentities(cfg.Keys, true)
+	if err != nil {
+		return nil, err
 	}
 
 	return &StaticAuthenticator{identities: identities}, nil

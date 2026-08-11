@@ -10,5 +10,12 @@
       "task_queue": "other-queue",
       "subject": "worker-fleet-b"
     }
+  },
+  "emails": {
+    "worker-fleet-a@example-project.iam.gserviceaccount.com": {
+      "namespace": "default",
+      "task_queue": "proxy-test-queue",
+      "subject": "worker-fleet-a"
+    }
   }
 }

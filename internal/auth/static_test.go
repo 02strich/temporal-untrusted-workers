@@ -83,6 +83,31 @@ func TestStaticAuthenticator_TwoDistinctKeys(t *testing.T) {
 	}
 }
 
+// TestStaticAuthenticator_IgnoresEmailsSection confirms the static
+// authenticator reads only the "keys" section of the unified file, not
+// "emails".
+func TestStaticAuthenticator_IgnoresEmailsSection(t *testing.T) {
+	path := writeStaticAuthFile(t, `{
+		"keys":   {"key-a": {"namespace": "default", "task_queue": "key-queue"}},
+		"emails": {"sa@project.iam.gserviceaccount.com": {"namespace": "default", "task_queue": "email-queue"}}
+	}`)
+
+	a, err := NewStaticAuthenticatorFromFile(path)
+	if err != nil {
+		t.Fatalf("NewStaticAuthenticatorFromFile: %v", err)
+	}
+
+	id, _ := a.Authenticate(context.Background(), "key-a")
+	if !id.Valid || id.TaskQueue != "key-queue" {
+		t.Fatalf("expected key-queue from keys section, got %+v", id)
+	}
+
+	// The email address is not a valid API key.
+	if idEmail, _ := a.Authenticate(context.Background(), "sa@project.iam.gserviceaccount.com"); idEmail.Valid {
+		t.Fatalf("email address must not authenticate as a static key: %+v", idEmail)
+	}
+}
+
 func TestStaticAuthenticator_MissingField(t *testing.T) {
 	path := writeStaticAuthFile(t, `{
 		"keys": {

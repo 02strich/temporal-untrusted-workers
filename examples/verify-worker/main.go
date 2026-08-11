@@ -16,8 +16,12 @@ package main
 
 import (
 	"context"
+	"io"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"go.temporal.io/sdk/client"
@@ -63,10 +67,13 @@ func main() {
 	proxyAddr := getEnv("VERIFY_PROXY_ADDR", "127.0.0.1:7243")
 	namespace := getEnv("VERIFY_NAMESPACE", "default")
 	taskQueue := getEnv("VERIFY_TASK_QUEUE", "proxy-test-queue")
-	apiKey := os.Getenv("VERIFY_API_KEY")
-	if apiKey == "" {
-		log.Fatal("VERIFY_API_KEY is required")
-	}
+	authMode := getEnv("VERIFY_AUTH_MODE", authModeStatic)
+
+	// The proxy accepts the credential the same way in either mode (an
+	// "authorization: Bearer <cred>" header via NewAPIKeyStaticCredentials);
+	// VERIFY_AUTH_MODE only changes what that credential is, mirroring the
+	// proxy's own TEMPORAL_PROXY_AUTH_MODE.
+	credential := resolveCredential(authMode, proxyAddr)
 
 	// Plaintext by default (matching the proxy's local-dev default); set
 	// VERIFY_TLS_MODE=tls to connect to a proxy whose downstream listener
@@ -79,7 +86,7 @@ func main() {
 	c, err := client.Dial(client.Options{
 		HostPort:          proxyAddr,
 		Namespace:         namespace,
-		Credentials:       client.NewAPIKeyStaticCredentials(apiKey),
+		Credentials:       client.NewAPIKeyStaticCredentials(credential),
 		ConnectionOptions: connOpts,
 	})
 	if err != nil {
@@ -96,6 +103,75 @@ func main() {
 	if err := w.Run(worker.InterruptCh()); err != nil {
 		log.Fatalf("worker run failed: %v", err)
 	}
+}
+
+// Worker auth modes, mirroring the proxy's TEMPORAL_PROXY_AUTH_MODE.
+const (
+	authModeStatic = "static"
+	authModeJWT    = "jwt"
+)
+
+// resolveCredential returns the credential the worker presents to the proxy,
+// per VERIFY_AUTH_MODE. In "static" mode it is VERIFY_API_KEY (a shared API
+// key); in "jwt" mode it is this instance's Google Cloud Run identity token,
+// which the proxy validates when it runs with TEMPORAL_PROXY_AUTH_MODE=jwt.
+func resolveCredential(authMode string, proxyAddr string) string {
+	switch authMode {
+	case authModeStatic:
+		apiKey := os.Getenv("VERIFY_API_KEY")
+		if apiKey == "" {
+			log.Fatal("VERIFY_API_KEY is required when VERIFY_AUTH_MODE=static")
+		}
+		return apiKey
+	case authModeJWT:
+		audience := getEnv("VERIFY_CLOUDRUN_TOKEN_AUDIENCE", proxyAddr)
+		cloudRunToken := getCloudRunToken(audience)
+
+		if cloudRunToken == nil {
+			log.Fatalf("VERIFY_AUTH_MODE=jwt requires a Cloud Run identity token, but none is available (audience=%q) - this mode must run on Cloud Run/GCP", audience)
+		}
+		return *cloudRunToken
+	default:
+		log.Fatalf("VERIFY_AUTH_MODE: invalid value %q (want %q or %q)", authMode, authModeStatic, authModeJWT)
+		return "" // unreachable: log.Fatalf exits.
+	}
+}
+
+// getCloudRunToken fetches this instance's service-account identity token
+// from the GCP metadata server and returns it, when running on Cloud Run (or any
+// GCP compute that exposes a metadata server).
+func getCloudRunToken(audience string) *string {
+	const metadataURL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metadataURL+"?audience="+url.QueryEscape(audience), nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Metadata-Flavor", "Google")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		// Metadata server unreachable - not running on Cloud Run. Nothing to
+		// log; this is the expected path for local dev.
+		return nil
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Cloud Run identity token: reading metadata response: %v", err)
+		return nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Cloud Run identity token unavailable: metadata server returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return nil
+	}
+
+	token := strings.TrimSpace(string(body))
+	return &token
 }
 
 func getEnv(key, def string) string {

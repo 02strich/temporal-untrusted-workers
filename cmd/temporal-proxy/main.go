@@ -38,7 +38,13 @@ func run() error {
 	}
 	configureLogging(cfg.LogLevel)
 
-	authenticator, err := auth.NewStaticAuthenticatorFromFile(cfg.StaticAuthFile)
+	var authenticator auth.Authenticator
+	switch cfg.WorkerAuthMode {
+	case config.WorkerAuthModeJWT:
+		authenticator, err = auth.NewJWTAuthenticatorFromFile(context.Background(), cfg.StaticAuthFile, cfg.JWTAudience)
+	default:
+		authenticator, err = auth.NewStaticAuthenticatorFromFile(cfg.StaticAuthFile)
+	}
 	if err != nil {
 		return fmt.Errorf("building authenticator: %w", err)
 	}

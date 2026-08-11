@@ -12,8 +12,14 @@ import (
 )
 
 const (
+	// Upstream (proxy -> Temporal server) auth modes.
 	AuthModeNone   = "none"
 	AuthModeAPIKey = "api-key"
+
+	// Worker-facing auth modes: how downstream workers authenticate to the
+	// proxy. Distinct from the upstream AuthMode* values above.
+	WorkerAuthModeStatic = "static"
+	WorkerAuthModeJWT    = "jwt"
 
 	TLSModePlaintext = "plaintext"
 	TLSModeTLS       = "tls"
@@ -47,7 +53,11 @@ type Config struct {
 	Upstream   UpstreamConfig
 	Downstream DownstreamConfig
 
+	// WorkerAuthMode selects how downstream workers authenticate:
+	// WorkerAuthModeStatic (API keys) or WorkerAuthModeJWT (Google ID tokens).
+	WorkerAuthMode string
 	StaticAuthFile string
+	JWTAudience    string
 
 	TokenCacheTTL     time.Duration
 	TokenCacheMaxSize int
@@ -76,7 +86,9 @@ func Load() (Config, error) {
 			CertFile:   os.Getenv("TEMPORAL_PROXY_DOWNSTREAM_TLS_CERT_FILE"),
 			KeyFile:    os.Getenv("TEMPORAL_PROXY_DOWNSTREAM_TLS_KEY_FILE"),
 		},
+		WorkerAuthMode: getEnv("TEMPORAL_PROXY_AUTH_MODE", WorkerAuthModeStatic),
 		StaticAuthFile: getEnv("TEMPORAL_PROXY_STATIC_AUTH_FILE", defaultStaticAuthFile()),
+		JWTAudience:    os.Getenv("TEMPORAL_PROXY_JWT_AUDIENCE"),
 		LogLevel:       getEnv("TEMPORAL_PROXY_LOG_LEVEL", "info"),
 	}
 
@@ -138,7 +150,17 @@ func (c Config) validate() []error {
 	}
 
 	if c.StaticAuthFile == "" {
-		errs = append(errs, errors.New("TEMPORAL_PROXY_STATIC_AUTH_FILE is required (it configures the only shipped Authenticator)"))
+		errs = append(errs, errors.New("TEMPORAL_PROXY_STATIC_AUTH_FILE is required (it configures the shipped Authenticators)"))
+	}
+
+	switch c.WorkerAuthMode {
+	case WorkerAuthModeStatic:
+	case WorkerAuthModeJWT:
+		if c.JWTAudience == "" {
+			errs = append(errs, errors.New("TEMPORAL_PROXY_JWT_AUDIENCE is required when TEMPORAL_PROXY_AUTH_MODE=jwt"))
+		}
+	default:
+		errs = append(errs, fmt.Errorf("TEMPORAL_PROXY_AUTH_MODE: invalid value %q (want %q or %q)", c.WorkerAuthMode, WorkerAuthModeStatic, WorkerAuthModeJWT))
 	}
 
 	if c.TokenCacheTTL <= 0 {
