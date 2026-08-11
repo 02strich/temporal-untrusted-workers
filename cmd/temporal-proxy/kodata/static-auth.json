@@ -1,0 +1,9 @@
+{
+  "keys": {
+    "test": {
+      "namespace": "stefan-ephemeral-workers.a2dd6",
+      "task_queue": "proxy-test-queue",
+      "subject": "worker-fleet-a"
+    }
+  }
+}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 )
@@ -75,7 +76,7 @@ func Load() (Config, error) {
 			CertFile:   os.Getenv("TEMPORAL_PROXY_DOWNSTREAM_TLS_CERT_FILE"),
 			KeyFile:    os.Getenv("TEMPORAL_PROXY_DOWNSTREAM_TLS_KEY_FILE"),
 		},
-		StaticAuthFile: os.Getenv("TEMPORAL_PROXY_STATIC_AUTH_FILE"),
+		StaticAuthFile: getEnv("TEMPORAL_PROXY_STATIC_AUTH_FILE", defaultStaticAuthFile()),
 		LogLevel:       getEnv("TEMPORAL_PROXY_LOG_LEVEL", "info"),
 	}
 
@@ -149,6 +150,18 @@ func (c Config) validate() []error {
 	}
 
 	return errs
+}
+
+// defaultStaticAuthFile returns the path to the static auth file bundled into
+// the container image. ko copies cmd/temporal-proxy/kodata into the image and
+// sets KO_DATA_PATH to its location at runtime, so the shipped default works
+// out of the box; outside a ko image KO_DATA_PATH is unset and the file must be
+// provided explicitly via TEMPORAL_PROXY_STATIC_AUTH_FILE.
+func defaultStaticAuthFile() string {
+	if dir := os.Getenv("KO_DATA_PATH"); dir != "" {
+		return filepath.Join(dir, "static-auth.json")
+	}
+	return ""
 }
 
 func getEnv(key, def string) string {
