@@ -136,32 +136,40 @@ All configuration is via environment variables (`internal/config/config.go`).
 
 ## The verify examples
 
-`examples/` is a separate Go module (`examples/go.mod`) holding two small programs used to exercise
-the proxy end-to-end. They are also the reference for how a real worker and control-plane client
-interact with the proxy.
+`examples/` holds three small programs used to exercise the proxy end-to-end, across two ecosystems:
+a Go module (`examples/go.mod`) with `verify-worker` and `verify-client`, and a separate npm package
+(`examples/verify-worker-ts`) with a TypeScript port of the worker. They are also the reference for
+how a real worker and control-plane client interact with the proxy.
 
-- **`examples/verify-worker`** — a minimal Temporal SDK worker that connects **through the proxy**
+- **`examples/verify-worker`** — a minimal Temporal Go SDK worker that connects **through the proxy**
   using an API-key/JWT credential, exactly as an untrusted worker would. It registers `EchoWorkflow`
   (schedules an activity) and `CrossQueueWorkflow` (deliberately targets a forbidden queue so the
   proxy's command validation is observable). On startup it also fetches and logs its Cloud Run
   identity token if one is available.
+- **`examples/verify-worker-ts`** — the same worker (identical `EchoWorkflow`/`CrossQueueWorkflow`/
+  `EchoActivity`, identical `VERIFY_*` env vars) written against the official `@temporalio/*` SDK
+  instead, a drop-in swap for `verify-worker` when you want a TypeScript/Node reference. One knob
+  can't be mirrored: the SDK's `TLSConfig` type has no certificate-verification-skip option, so
+  `VERIFY_TLS_SKIP_VERIFY=true` makes it fail fast. Its native Rust addon (`@temporalio/core-bridge`)
+  ships glibc-only prebuilt binaries, so its `Dockerfile` uses a Debian-slim base — never Alpine.
 - **`examples/verify-client`** — a **direct** (non-proxied) client that talks straight to the real
   Temporal server to start the workflow (`StartWorkflowExecution` is *not* an allowed proxy RPC), then
   awaits the result produced by the proxied worker, and asserts the cross-queue command was blocked.
+  Works against either worker, since it only starts workflows by name.
 
 ### Verify env vars
 
-`verify-worker`:
+`verify-worker` and `verify-worker-ts` share the identical set:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `VERIFY_PROXY_ADDR` | `127.0.0.1:7243` | The proxy address to connect to. |
-| `VERIFY_NAMESPACE` | `default` | Namespace (must match the identity's). |
-| `VERIFY_TASK_QUEUE` | `proxy-test-queue` | Task queue (must match the identity's). |
-| `VERIFY_AUTH_MODE` | `static` | `static` (use `VERIFY_API_KEY`) or `jwt` (use the Cloud Run identity token). Mirrors the proxy. |
-| `VERIFY_API_KEY` | — | Required in `static` mode. |
-| `VERIFY_CLOUDRUN_TOKEN_AUDIENCE` | `$VERIFY_PROXY_ADDR` | Audience requested for the Cloud Run identity token; match the proxy's `TEMPORAL_PROXY_JWT_AUDIENCE`. |
-| `VERIFY_TLS_MODE` | `plaintext` | `plaintext` or `tls`. Use `tls` to reach a Cloud Run proxy. Also `VERIFY_TLS_CA_FILE`, `VERIFY_TLS_SERVER_NAME`, `VERIFY_TLS_SKIP_VERIFY`. |
+| Variable                         | Default              | Description                                                                                                                                                             |
+| -------------------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `VERIFY_PROXY_ADDR`              | `127.0.0.1:7243`     | The proxy address to connect to.                                                                                                                                        |
+| `VERIFY_NAMESPACE`               | `default`            | Namespace (must match the identity's).                                                                                                                                  |
+| `VERIFY_TASK_QUEUE`              | `proxy-test-queue`   | Task queue (must match the identity's).                                                                                                                                 |
+| `VERIFY_AUTH_MODE`               | `static`             | `static` (use `VERIFY_API_KEY`) or `jwt` (use the Cloud Run identity token). Mirrors the proxy.                                                                         |
+| `VERIFY_API_KEY`                 | —                    | Required in `static` mode.                                                                                                                                              |
+| `VERIFY_CLOUDRUN_TOKEN_AUDIENCE` | `$VERIFY_PROXY_ADDR` | Audience requested for the Cloud Run identity token; match the proxy's `TEMPORAL_PROXY_JWT_AUDIENCE`.                                                                   |
+| `VERIFY_TLS_MODE`                | `plaintext`          | `plaintext` or `tls`. Use `tls` to reach a Cloud Run proxy. Also `VERIFY_TLS_CA_FILE`, `VERIFY_TLS_SERVER_NAME`, `VERIFY_TLS_SKIP_VERIFY` (Go worker only — see above). |
 
 `verify-client` uses `VERIFY_UPSTREAM_ADDR` (default `127.0.0.1:7233`), `VERIFY_NAMESPACE`,
 `VERIFY_TASK_QUEUE`, and the same `VERIFY_TLS_*` set.
@@ -183,6 +191,9 @@ go run ./cmd/temporal-proxy
 # 3. The worker, through the proxy (testkey123 → default / proxy-test-queue in the testdata file)
 cd examples && VERIFY_API_KEY=testkey123 go run ./verify-worker
 
+# 3 (alternative). Or the TypeScript worker instead - same effect, don't run both at once
+cd examples/verify-worker-ts && npm ci && npm run build && VERIFY_API_KEY=testkey123 npm start
+
 # 4. Drive a workflow directly against the dev server and assert end-to-end behavior
 cd examples && go run ./verify-client
 ```
@@ -191,22 +202,27 @@ cd examples && go run ./verify-client
 
 ## Building container images
 
-Images are built and pushed with [`ko`](https://ko.build) (no Dockerfile). See the `Makefile`.
+The two Go binaries are built and pushed with [`ko`](https://ko.build) (no Dockerfile);
+`verify-worker-ts` is a Node/TypeScript project, which `ko` can't build, so it uses a plain
+`Dockerfile` + `docker buildx` instead. See the `Makefile`.
 
 ```bash
 # install ko if needed
 make ko-install
 
-# build & push both images under one repo
+# build & push all three images under one repo (needs ko + a running Docker daemon)
 make images KO_DOCKER_REPO=ghcr.io/you/repo
 
 # or individually, with a tag
-make image-proxy         KO_DOCKER_REPO=ghcr.io/you/repo TAGS=v0.1.0
-make image-verify-worker KO_DOCKER_REPO=ghcr.io/you/repo TAGS=v0.1.0
+make image-proxy            KO_DOCKER_REPO=ghcr.io/you/repo TAGS=v0.1.0
+make image-verify-worker    KO_DOCKER_REPO=ghcr.io/you/repo TAGS=v0.1.0
+make image-verify-worker-ts KO_DOCKER_REPO=ghcr.io/you/repo TAGS=v0.1.0
 ```
 
-This publishes `$(KO_DOCKER_REPO)/temporal-proxy` and `$(KO_DOCKER_REPO)/verify-worker` (multi-arch
-`linux/amd64,linux/arm64` by default). `verify-worker` builds from the `examples/` module.
+This publishes `$(KO_DOCKER_REPO)/temporal-proxy`, `$(KO_DOCKER_REPO)/verify-worker`, and
+`$(KO_DOCKER_REPO)/verify-worker-ts` (multi-arch `linux/amd64,linux/arm64` by default).
+`verify-worker` builds from the `examples/` Go module; `verify-worker-ts` builds from
+`examples/verify-worker-ts` via Docker (needs Docker/OrbStack running locally).
 
 ---
 
@@ -285,3 +301,4 @@ Key points:
   the per-instance token cache constraint applies only to the **proxy** service.
 - Swap `verify-worker` for your own worker image the same way; the proxy is worker-agnostic (it only
   depends on `go.temporal.io/api`, so any SDK/language that speaks the same gRPC surface works).
+  `verify-worker-ts` (`$(KO_DOCKER_REPO)/verify-worker-ts`) is a ready-made example of that swap.

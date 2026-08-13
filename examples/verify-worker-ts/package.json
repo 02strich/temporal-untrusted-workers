@@ -1,0 +1,19 @@
+{
+  "name": "verify-worker-ts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TypeScript port of examples/verify-worker: a minimal Temporal SDK worker used to manually verify the proxy end-to-end, connecting through the proxy (not directly to the upstream Temporal server) with an API-key or JWT credential, exactly as a real untrusted worker would.",
+  "scripts": {
+    "build": "tsc",
+    "start": "node lib/worker.js"
+  },
+  "dependencies": {
+    "@temporalio/activity": "1.22.0",
+    "@temporalio/worker": "1.22.0",
+    "@temporalio/workflow": "1.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.3"
+  }
+}
