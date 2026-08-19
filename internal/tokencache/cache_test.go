@@ -1,19 +1,27 @@
 package tokencache
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
 )
+
+var testContext = context.Background()
 
 func TestCache_PutGet(t *testing.T) {
 	c := New(time.Hour, 1000)
 	defer c.Close()
 
 	token := []byte("token-a")
-	c.Put(token, Entry{Namespace: "ns", TaskQueue: "queue-a"})
+	if err := c.Put(testContext, token, Entry{Namespace: "ns", TaskQueue: "queue-a"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
 
-	entry, ok := c.Get(token)
+	entry, ok, err := c.Get(testContext, token)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
 	if !ok {
 		t.Fatalf("expected token to be found")
 	}
@@ -26,7 +34,9 @@ func TestCache_UnknownToken(t *testing.T) {
 	c := New(time.Hour, 1000)
 	defer c.Close()
 
-	if _, ok := c.Get([]byte("never-put")); ok {
+	if _, ok, err := c.Get(testContext, []byte("never-put")); err != nil {
+		t.Fatalf("Get: %v", err)
+	} else if ok {
 		t.Fatalf("expected unknown token to miss")
 	}
 }
@@ -36,10 +46,16 @@ func TestCache_Delete(t *testing.T) {
 	defer c.Close()
 
 	token := []byte("token-a")
-	c.Put(token, Entry{Namespace: "ns", TaskQueue: "queue-a"})
-	c.Delete(token)
+	if err := c.Put(testContext, token, Entry{Namespace: "ns", TaskQueue: "queue-a"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := c.Delete(testContext, token); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
 
-	if _, ok := c.Get(token); ok {
+	if _, ok, err := c.Get(testContext, token); err != nil {
+		t.Fatalf("Get: %v", err)
+	} else if ok {
 		t.Fatalf("expected deleted token to miss")
 	}
 }
@@ -49,11 +65,15 @@ func TestCache_ExpiresAfterTTL(t *testing.T) {
 	defer c.Close()
 
 	token := []byte("token-a")
-	c.Put(token, Entry{Namespace: "ns", TaskQueue: "queue-a"})
+	if err := c.Put(testContext, token, Entry{Namespace: "ns", TaskQueue: "queue-a"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
 
 	time.Sleep(100 * time.Millisecond)
 
-	if _, ok := c.Get(token); ok {
+	if _, ok, err := c.Get(testContext, token); err != nil {
+		t.Fatalf("Get: %v", err)
+	} else if ok {
 		t.Fatalf("expected expired token to miss")
 	}
 }
@@ -63,14 +83,18 @@ func TestCache_GetSlidesTTLForward(t *testing.T) {
 	defer c.Close()
 
 	token := []byte("token-a")
-	c.Put(token, Entry{Namespace: "ns", TaskQueue: "queue-a"})
+	if err := c.Put(testContext, token, Entry{Namespace: "ns", TaskQueue: "queue-a"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
 
 	// Heartbeat every 60ms, well under the 100ms TTL, for longer than the
 	// original TTL would have allowed - simulates an actively heartbeating
 	// long-running activity.
 	for i := range 4 {
 		time.Sleep(60 * time.Millisecond)
-		if _, ok := c.Get(token); !ok {
+		if _, ok, err := c.Get(testContext, token); err != nil {
+			t.Fatalf("Get: %v", err)
+		} else if !ok {
 			t.Fatalf("expected token to still be live at iteration %d", i)
 		}
 	}
@@ -86,7 +110,9 @@ func TestCache_LRUEvictionUnderShardCap(t *testing.T) {
 
 	for i := range 10000 {
 		token := fmt.Appendf(nil, "token-%d", i)
-		c.Put(token, Entry{Namespace: "ns", TaskQueue: "queue-a"})
+		if err := c.Put(testContext, token, Entry{Namespace: "ns", TaskQueue: "queue-a"}); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
 	}
 
 	total := 0
@@ -105,7 +131,9 @@ func TestCache_JanitorRemovesExpiredEntries(t *testing.T) {
 	defer c.Close()
 
 	token := []byte("token-a")
-	c.Put(token, Entry{Namespace: "ns", TaskQueue: "queue-a"})
+	if err := c.Put(testContext, token, Entry{Namespace: "ns", TaskQueue: "queue-a"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
 
 	// Janitor interval is clamped to a minimum of 15s in New, so directly
 	// invoke the sweep instead of waiting on the real ticker.

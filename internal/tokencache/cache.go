@@ -6,6 +6,7 @@ package tokencache
 
 import (
 	"container/list"
+	"context"
 	"hash/maphash"
 	"sync"
 	"time"
@@ -17,6 +18,15 @@ const numShards = 32
 type Entry struct {
 	Namespace string
 	TaskQueue string
+}
+
+// Store records which identity each issued Temporal task token belongs to.
+// Implementations must be safe for concurrent use.
+type Store interface {
+	Put(context.Context, []byte, Entry) error
+	Get(context.Context, []byte) (Entry, bool, error)
+	Delete(context.Context, []byte) error
+	Close() error
 }
 
 type item struct {
@@ -149,8 +159,9 @@ func New(ttl time.Duration, maxSize int) *Cache {
 }
 
 // Close stops the background janitor goroutine. Safe to call once.
-func (c *Cache) Close() {
+func (c *Cache) Close() error {
 	close(c.stopJanitor)
+	return nil
 }
 
 func (c *Cache) runJanitor(interval time.Duration) {
@@ -177,17 +188,20 @@ func (c *Cache) shardFor(token []byte) *shard {
 
 // Put registers token as belonging to entry, sliding its expiry ttl forward
 // from now.
-func (c *Cache) Put(token []byte, entry Entry) {
+func (c *Cache) Put(_ context.Context, token []byte, entry Entry) error {
 	c.shardFor(token).put(string(token), entry, c.ttl)
+	return nil
 }
 
 // Get looks up token, returning its entry and true on a live hit. A hit
 // slides the token's TTL forward from now.
-func (c *Cache) Get(token []byte) (Entry, bool) {
-	return c.shardFor(token).get(string(token), c.ttl)
+func (c *Cache) Get(_ context.Context, token []byte) (Entry, bool, error) {
+	entry, ok := c.shardFor(token).get(string(token), c.ttl)
+	return entry, ok, nil
 }
 
 // Delete removes token, e.g. once a terminal Respond call has consumed it.
-func (c *Cache) Delete(token []byte) {
+func (c *Cache) Delete(_ context.Context, token []byte) error {
 	c.shardFor(token).delete(string(token))
+	return nil
 }

@@ -6,12 +6,15 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"go.temporal.io/api/workflowservice/v1"
 	"google.golang.org/grpc"
@@ -55,8 +58,15 @@ func run() error {
 	}
 	defer upstreamConn.Close()
 
-	cache := tokencache.New(cfg.TokenCacheTTL, cfg.TokenCacheMaxSize)
-	defer cache.Close()
+	cache, err := buildTokenCache(context.Background(), cfg)
+	if err != nil {
+		return fmt.Errorf("building token cache: %w", err)
+	}
+	defer func() {
+		if err := cache.Close(); err != nil {
+			slog.Warn("closing token cache", "error", err)
+		}
+	}()
 
 	serverOpts := []grpc.ServerOption{grpc.UnaryInterceptor(proxy.NewInterceptor(authenticator, cache))}
 	if cfg.Downstream.TLSMode == config.TLSModeTLS {
@@ -80,7 +90,7 @@ func run() error {
 
 	serveErr := make(chan error, 1)
 	go func() {
-		slog.Info("temporal-proxy listening", "addr", cfg.Downstream.ListenAddr, "upstream", cfg.Upstream.Addr)
+		slog.Info("temporal-proxy listening", "addr", cfg.Downstream.ListenAddr, "upstream", cfg.Upstream.Addr, "token_cache_backend", cfg.TokenCacheBackend)
 		serveErr <- grpcServer.Serve(listener)
 	}()
 
@@ -100,4 +110,60 @@ func configureLogging(level string) {
 		lvl = slog.LevelInfo
 	}
 	slog.SetLogLoggerLevel(lvl)
+}
+
+func buildTokenCache(ctx context.Context, cfg config.Config) (tokencache.Store, error) {
+	switch cfg.TokenCacheBackend {
+	case config.TokenCacheBackendValkey:
+		tlsConfig, err := valkeyTLSConfig(cfg.Valkey)
+		if err != nil {
+			return nil, err
+		}
+		pingTimeout := maxDuration(cfg.Valkey.DialTimeout, cfg.Valkey.ReadTimeout)
+		pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
+		defer cancel()
+		return tokencache.NewValkeyStore(pingCtx, tokencache.ValkeyOptions{
+			Addrs:        cfg.Valkey.Addrs,
+			Password:     cfg.Valkey.Password,
+			TLSConfig:    tlsConfig,
+			DialTimeout:  cfg.Valkey.DialTimeout,
+			ReadTimeout:  cfg.Valkey.ReadTimeout,
+			WriteTimeout: cfg.Valkey.WriteTimeout,
+			TTL:          cfg.TokenCacheTTL,
+		})
+	default:
+		return tokencache.New(cfg.TokenCacheTTL, cfg.TokenCacheMaxSize), nil
+	}
+}
+
+func valkeyTLSConfig(cfg config.ValkeyConfig) (*tls.Config, error) {
+	if cfg.TLSMode == config.TLSModePlaintext {
+		return nil, nil
+	}
+
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+	if cfg.TLSCAFile == "" {
+		return tlsConfig, nil
+	}
+
+	pem, err := os.ReadFile(cfg.TLSCAFile)
+	if err != nil {
+		return nil, fmt.Errorf("reading valkey TLS CA file: %w", err)
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil {
+		pool = x509.NewCertPool()
+	}
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("reading valkey TLS CA file: no certificates found in %s", cfg.TLSCAFile)
+	}
+	tlsConfig.RootCAs = pool
+	return tlsConfig, nil
+}
+
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
 }

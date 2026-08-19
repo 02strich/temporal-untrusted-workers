@@ -3,6 +3,7 @@ module github.com/02strich/temporal-untrusted-workers
 go 1.25.4
 
 require (
+	github.com/valkey-io/valkey-go v1.0.77
 	go.temporal.io/api v1.63.5
 	google.golang.org/api v0.292.0
 	google.golang.org/grpc v1.83.0
@@ -31,7 +32,7 @@ require (
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260630182238-925bb5da69e7 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260803160001-6ac0973c030d // indirect
 )

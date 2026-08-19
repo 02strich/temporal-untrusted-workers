@@ -51,6 +51,61 @@ func callInterceptor(t *testing.T, interceptor grpc.UnaryServerInterceptor, ctx 
 	return got, err, handlerCalled
 }
 
+func putCache(t *testing.T, cache tokencache.Store, token []byte, entry tokencache.Entry) {
+	t.Helper()
+	if err := cache.Put(context.Background(), token, entry); err != nil {
+		t.Fatalf("cache.Put: %v", err)
+	}
+}
+
+func getCache(t *testing.T, cache tokencache.Store, token []byte) (tokencache.Entry, bool) {
+	t.Helper()
+	entry, ok, err := cache.Get(context.Background(), token)
+	if err != nil {
+		t.Fatalf("cache.Get: %v", err)
+	}
+	return entry, ok
+}
+
+type fakeTokenStore struct {
+	entries   map[string]tokencache.Entry
+	getErr    error
+	putErr    error
+	deleteErr error
+}
+
+func newFakeTokenStore() *fakeTokenStore {
+	return &fakeTokenStore{entries: make(map[string]tokencache.Entry)}
+}
+
+func (f *fakeTokenStore) Put(_ context.Context, token []byte, entry tokencache.Entry) error {
+	if f.putErr != nil {
+		return f.putErr
+	}
+	f.entries[string(token)] = entry
+	return nil
+}
+
+func (f *fakeTokenStore) Get(_ context.Context, token []byte) (tokencache.Entry, bool, error) {
+	if f.getErr != nil {
+		return tokencache.Entry{}, false, f.getErr
+	}
+	entry, ok := f.entries[string(token)]
+	return entry, ok, nil
+}
+
+func (f *fakeTokenStore) Delete(_ context.Context, token []byte) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	delete(f.entries, string(token))
+	return nil
+}
+
+func (f *fakeTokenStore) Close() error {
+	return nil
+}
+
 func TestInterceptor_DeniesUnknownRPC(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
 		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
@@ -137,7 +192,7 @@ func TestInterceptor_PollAllowsMatchingQueue(t *testing.T) {
 	}
 
 	// The returned task token should now be registered under this identity.
-	entry, ok := cache.Get([]byte("tok-1"))
+	entry, ok := getCache(t, cache, []byte("tok-1"))
 	if !ok || entry.Namespace != "ns" || entry.TaskQueue != "queue-a" {
 		t.Fatalf("expected token to be cached for the polling identity, got %+v (found=%v)", entry, ok)
 	}
@@ -174,7 +229,7 @@ func TestInterceptor_PollNexusAllowsMatchingQueueAndCachesToken(t *testing.T) {
 		t.Fatalf("expected response to pass through")
 	}
 
-	entry, ok := cache.Get([]byte("nexus-tok-1"))
+	entry, ok := getCache(t, cache, []byte("nexus-tok-1"))
 	if !ok || entry.Namespace != "ns" || entry.TaskQueue != "queue-a" {
 		t.Fatalf("expected nexus token to be cached for the polling identity, got %+v (found=%v)", entry, ok)
 	}
@@ -281,7 +336,7 @@ func shutdownInterceptor(t *testing.T) grpc.UnaryServerInterceptor {
 		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
-	t.Cleanup(cache.Close)
+	t.Cleanup(func() { _ = cache.Close() })
 	return NewInterceptor(authr, cache)
 }
 
@@ -499,7 +554,7 @@ func TestInterceptor_TokenScoping(t *testing.T) {
 	interceptor := NewInterceptor(authr, cache)
 
 	// A token registered for queue-a's identity...
-	cache.Put([]byte("tok-a"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
+	putCache(t, cache, []byte("tok-a"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
 
 	// ...must be rejected when presented by queue-b's identity, even though
 	// queue-b's own key is otherwise perfectly valid.
@@ -539,6 +594,70 @@ func TestInterceptor_TokenScoping(t *testing.T) {
 	}
 }
 
+func TestInterceptor_TokenCacheGetErrorFailsClosed(t *testing.T) {
+	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
+		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+	}}
+	cache := newFakeTokenStore()
+	cache.getErr = errors.New("cache read failed")
+	interceptor := NewInterceptor(authr, cache)
+
+	req := &workflowservice.RespondActivityTaskCompletedRequest{Namespace: "ns", TaskToken: []byte("tok-a")}
+	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
+		"/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskCompleted",
+		req, &workflowservice.RespondActivityTaskCompletedResponse{}, nil)
+
+	if called {
+		t.Fatalf("handler must not run when token cache read fails")
+	}
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected Unavailable, got %v", err)
+	}
+}
+
+func TestInterceptor_TokenCachePutErrorFailsSuccessfulPoll(t *testing.T) {
+	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
+		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+	}}
+	cache := newFakeTokenStore()
+	cache.putErr = errors.New("cache write failed")
+	interceptor := NewInterceptor(authr, cache)
+
+	req := &workflowservice.PollWorkflowTaskQueueRequest{Namespace: "ns", TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-a"}}
+	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
+		"/temporal.api.workflowservice.v1.WorkflowService/PollWorkflowTaskQueue",
+		req, &workflowservice.PollWorkflowTaskQueueResponse{TaskToken: []byte("tok-a")}, nil)
+
+	if !called {
+		t.Fatalf("handler should have run before post-success token cache put")
+	}
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected Unavailable, got %v", err)
+	}
+}
+
+func TestInterceptor_TokenCacheDeleteErrorDoesNotFailTerminalRPC(t *testing.T) {
+	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
+		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+	}}
+	cache := newFakeTokenStore()
+	cache.entries["tok-a"] = tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"}
+	cache.deleteErr = errors.New("cache delete failed")
+	interceptor := NewInterceptor(authr, cache)
+
+	req := &workflowservice.RespondActivityTaskCompletedRequest{Namespace: "ns", TaskToken: []byte("tok-a")}
+	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
+		"/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskCompleted",
+		req, &workflowservice.RespondActivityTaskCompletedResponse{}, nil)
+
+	if !called {
+		t.Fatalf("handler should have run for an authorized terminal RPC")
+	}
+	if err != nil {
+		t.Fatalf("delete failure must not fail terminal RPC, got %v", err)
+	}
+}
+
 func TestInterceptor_NexusResponsesUseTokenScoping(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
 		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
@@ -548,7 +667,7 @@ func TestInterceptor_NexusResponsesUseTokenScoping(t *testing.T) {
 	defer cache.Close()
 	interceptor := NewInterceptor(authr, cache)
 
-	cache.Put([]byte("nexus-tok-a"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
+	putCache(t, cache, []byte("nexus-tok-a"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
 
 	req := &workflowservice.RespondNexusTaskCompletedRequest{Namespace: "ns", TaskToken: []byte("nexus-tok-a")}
 	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-b"),
@@ -603,7 +722,7 @@ func TestInterceptor_NexusResponsesEvictToken(t *testing.T) {
 			defer cache.Close()
 			interceptor := NewInterceptor(authr, cache)
 
-			cache.Put([]byte("nexus-tok-a"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
+			putCache(t, cache, []byte("nexus-tok-a"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
 
 			_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
 				tt.method, tt.req, tt.resp, nil)
@@ -611,7 +730,7 @@ func TestInterceptor_NexusResponsesEvictToken(t *testing.T) {
 				t.Fatalf("expected successful call, called=%v err=%v", called, err)
 			}
 
-			if _, ok := cache.Get([]byte("nexus-tok-a")); ok {
+			if _, ok := getCache(t, cache, []byte("nexus-tok-a")); ok {
 				t.Fatalf("expected nexus token to be evicted after terminal response")
 			}
 		})
@@ -626,7 +745,7 @@ func TestInterceptor_TerminalRPCEvictsToken(t *testing.T) {
 	defer cache.Close()
 	interceptor := NewInterceptor(authr, cache)
 
-	cache.Put([]byte("tok-a"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
+	putCache(t, cache, []byte("tok-a"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
 
 	req := &workflowservice.RespondActivityTaskCompletedRequest{Namespace: "ns", TaskToken: []byte("tok-a")}
 	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
@@ -636,7 +755,7 @@ func TestInterceptor_TerminalRPCEvictsToken(t *testing.T) {
 		t.Fatalf("expected successful call, called=%v err=%v", called, err)
 	}
 
-	if _, ok := cache.Get([]byte("tok-a")); ok {
+	if _, ok := getCache(t, cache, []byte("tok-a")); ok {
 		t.Fatalf("expected token to be evicted after a terminal Respond call")
 	}
 }
@@ -649,7 +768,7 @@ func TestInterceptor_HeartbeatDoesNotEvictToken(t *testing.T) {
 	defer cache.Close()
 	interceptor := NewInterceptor(authr, cache)
 
-	cache.Put([]byte("tok-a"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
+	putCache(t, cache, []byte("tok-a"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
 
 	req := &workflowservice.RecordActivityTaskHeartbeatRequest{Namespace: "ns", TaskToken: []byte("tok-a")}
 	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
@@ -659,7 +778,7 @@ func TestInterceptor_HeartbeatDoesNotEvictToken(t *testing.T) {
 		t.Fatalf("expected successful call, called=%v err=%v", called, err)
 	}
 
-	if _, ok := cache.Get([]byte("tok-a")); !ok {
+	if _, ok := getCache(t, cache, []byte("tok-a")); !ok {
 		t.Fatalf("expected token to remain live after a heartbeat")
 	}
 }
@@ -672,7 +791,7 @@ func TestInterceptor_HandlerErrorDoesNotMutateCache(t *testing.T) {
 	defer cache.Close()
 	interceptor := NewInterceptor(authr, cache)
 
-	cache.Put([]byte("tok-a"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
+	putCache(t, cache, []byte("tok-a"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
 
 	req := &workflowservice.RespondActivityTaskCompletedRequest{Namespace: "ns", TaskToken: []byte("tok-a")}
 	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
@@ -685,7 +804,7 @@ func TestInterceptor_HandlerErrorDoesNotMutateCache(t *testing.T) {
 		t.Fatalf("expected the handler error to propagate")
 	}
 
-	if _, ok := cache.Get([]byte("tok-a")); !ok {
+	if _, ok := getCache(t, cache, []byte("tok-a")); !ok {
 		t.Fatalf("expected token to remain cached when the upstream call fails")
 	}
 }
@@ -698,7 +817,7 @@ func TestInterceptor_EagerDispatchTokensAreRegistered(t *testing.T) {
 	defer cache.Close()
 	interceptor := NewInterceptor(authr, cache)
 
-	cache.Put([]byte("wt-tok"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
+	putCache(t, cache, []byte("wt-tok"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
 
 	resp := &workflowservice.RespondWorkflowTaskCompletedResponse{
 		WorkflowTask: &workflowservice.PollWorkflowTaskQueueResponse{TaskToken: []byte("new-wt-tok")},
@@ -716,7 +835,7 @@ func TestInterceptor_EagerDispatchTokensAreRegistered(t *testing.T) {
 	}
 
 	for _, tok := range [][]byte{[]byte("new-wt-tok"), []byte("eager-activity-tok")} {
-		entry, ok := cache.Get(tok)
+		entry, ok := getCache(t, cache, tok)
 		if !ok || entry.Namespace != "ns" || entry.TaskQueue != "queue-a" {
 			t.Fatalf("expected eager-dispatch token %s to be registered, got %+v (found=%v)", tok, entry, ok)
 		}
@@ -733,7 +852,7 @@ func TestInterceptor_DeniesCommandTargetingDifferentQueue(t *testing.T) {
 
 	// The task token itself is legitimately bound to queue-a, but the
 	// emitted command tries to schedule an activity on queue-b.
-	cache.Put([]byte("wt-tok"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
+	putCache(t, cache, []byte("wt-tok"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
 
 	req := &workflowservice.RespondWorkflowTaskCompletedRequest{
 		Namespace: "ns",
@@ -762,7 +881,7 @@ func TestInterceptor_DeniesCommandTargetingDifferentQueue(t *testing.T) {
 
 	// The valid token must still be usable afterwards - a denied call must
 	// not have consumed it.
-	if _, ok := cache.Get([]byte("wt-tok")); !ok {
+	if _, ok := getCache(t, cache, []byte("wt-tok")); !ok {
 		t.Fatalf("expected token to remain cached after a command-validation denial")
 	}
 }
@@ -775,7 +894,7 @@ func TestInterceptor_AllowsCommandTargetingOwnQueue(t *testing.T) {
 	defer cache.Close()
 	interceptor := NewInterceptor(authr, cache)
 
-	cache.Put([]byte("wt-tok"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
+	putCache(t, cache, []byte("wt-tok"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
 
 	req := &workflowservice.RespondWorkflowTaskCompletedRequest{
 		Namespace: "ns",
@@ -855,7 +974,7 @@ func TestInterceptor_LogsCloudActionPerBillableCommand(t *testing.T) {
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
 	interceptor := NewInterceptor(authr, cache)
-	cache.Put([]byte("wt-tok"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
+	putCache(t, cache, []byte("wt-tok"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
 
 	buf := captureLogs(t)
 

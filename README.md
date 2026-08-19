@@ -134,8 +134,16 @@ All configuration is via environment variables (`internal/config/config.go`).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `TEMPORAL_PROXY_TOKEN_CACHE_BACKEND` | `local` | `local` or `valkey`. Use `valkey` for a shared cache across proxy instances. |
 | `TEMPORAL_PROXY_TOKEN_CACHE_TTL` | `1h` | How long an issued task token stays valid in the cache. |
-| `TEMPORAL_PROXY_TOKEN_CACHE_MAX_SIZE` | `100000` | Max task tokens cached (per instance). |
+| `TEMPORAL_PROXY_TOKEN_CACHE_MAX_SIZE` | `100000` | Max task tokens cached by the local backend (per instance). |
+| `TEMPORAL_PROXY_VALKEY_ADDRS` | — | Comma-separated Valkey/Memorystore addresses. Required when `TEMPORAL_PROXY_TOKEN_CACHE_BACKEND=valkey`. |
+| `TEMPORAL_PROXY_VALKEY_PASSWORD` | — | Optional Valkey Basic AUTH password/token. |
+| `TEMPORAL_PROXY_VALKEY_TLS_MODE` | `tls` | `plaintext` or `tls`. Defaults to TLS for GCP Memorystore deployments with in-transit encryption. |
+| `TEMPORAL_PROXY_VALKEY_TLS_CA_FILE` | system roots | Optional CA bundle for Valkey TLS. Empty = system roots. |
+| `TEMPORAL_PROXY_VALKEY_DIAL_TIMEOUT` | `5s` | Valkey connection timeout. |
+| `TEMPORAL_PROXY_VALKEY_READ_TIMEOUT` | `2s` | Valkey read operation timeout. |
+| `TEMPORAL_PROXY_VALKEY_WRITE_TIMEOUT` | `2s` | Valkey write operation timeout. |
 | `TEMPORAL_PROXY_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error`. Action logs are at `info`. |
 
 ---
@@ -269,11 +277,12 @@ Cloud Run specifics that matter here:
   API-key/JWT the worker sends there. Let the proxy authenticate instead of Cloud Run IAM. (In `jwt`
   mode the proxy is effectively validating a Google identity token itself — the same kind of token
   Cloud Run IAM would check — but mapping its email to a namespace/queue rather than an IAM role.)
-- **`--min-instances=1 --max-instances=1`** — the task-token cache is **in-memory and per-instance**.
-  A worker's `Poll` (which caches a token) and its follow-up `Respond` (which presents it) must land
-  on the same instance. Pinning to a single instance guarantees that. Scaling horizontally would
-  require sticky routing or a shared token store, which is not implemented — treat single-instance as
-  the supported configuration.
+- **Token cache backend:** the default `local` cache is in-memory and per-instance, so keep
+  `--min-instances=1 --max-instances=1` unless you configure
+  `TEMPORAL_PROXY_TOKEN_CACHE_BACKEND=valkey`. With the Valkey backend, point
+  `TEMPORAL_PROXY_VALKEY_ADDRS` at GCP Memorystore for Valkey and proxy instances can share issued
+  task tokens across horizontal scale-out. Cache read/put failures fail closed; terminal token-delete
+  failures are logged and ignored after the upstream terminal RPC succeeds.
 - The auth file and upstream API key are injected from **Secret Manager** (a mounted secret volume
   and an env secret, respectively).
 
@@ -303,8 +312,8 @@ Key points:
   email must be an entry in the proxy's `emails` table. No shared secret is exchanged.
 - **TLS to the proxy:** the worker connects to the Cloud Run service's public TLS endpoint on `:443`,
   so set `VERIFY_TLS_MODE=tls` (Cloud Run presents a publicly-trusted cert; system roots suffice).
-- To scale the fleet, raise the worker pool's instance count. Multiple worker instances are fine —
-  the per-instance token cache constraint applies only to the **proxy** service.
+- To scale the fleet, raise the worker pool's instance count. Multiple worker instances are fine; the
+  proxy service can also scale horizontally when it uses the Valkey token-cache backend.
 - Swap `verify-worker` for your own worker image the same way; the proxy is worker-agnostic (it only
   depends on `go.temporal.io/api`, so any SDK/language that speaks the same gRPC surface works).
   `verify-worker-ts` (`$(KO_DOCKER_REPO)/verify-worker-ts`) is a ready-made example of that swap.

@@ -30,6 +30,12 @@ func TestLoad_Defaults(t *testing.T) {
 		if cfg.WorkerAuthMode != WorkerAuthModeStatic {
 			t.Fatalf("unexpected default worker auth mode: %s", cfg.WorkerAuthMode)
 		}
+		if cfg.TokenCacheBackend != TokenCacheBackendLocal {
+			t.Fatalf("unexpected token cache backend: %s", cfg.TokenCacheBackend)
+		}
+		if cfg.Valkey.TLSMode != TLSModeTLS {
+			t.Fatalf("unexpected default valkey tls mode: %s", cfg.Valkey.TLSMode)
+		}
 	})
 }
 
@@ -112,6 +118,89 @@ func TestLoad_InvalidAuthMode(t *testing.T) {
 		_, err := Load()
 		if err == nil {
 			t.Fatalf("expected error for invalid auth mode")
+		}
+	})
+}
+
+func TestLoad_ValkeyTokenCacheRequiresAddrs(t *testing.T) {
+	withEnv(t, map[string]string{
+		"TEMPORAL_PROXY_STATIC_AUTH_FILE":    "/tmp/does-not-need-to-exist.json",
+		"TEMPORAL_PROXY_TOKEN_CACHE_BACKEND": TokenCacheBackendValkey,
+	}, func() {
+		_, err := Load()
+		if err == nil {
+			t.Fatalf("expected error when valkey backend is set without addrs")
+		}
+	})
+}
+
+func TestLoad_ValkeyTokenCacheConfig(t *testing.T) {
+	withEnv(t, map[string]string{
+		"TEMPORAL_PROXY_STATIC_AUTH_FILE":         "/tmp/does-not-need-to-exist.json",
+		"TEMPORAL_PROXY_TOKEN_CACHE_BACKEND":      TokenCacheBackendValkey,
+		"TEMPORAL_PROXY_VALKEY_ADDRS":             "10.0.0.1:6379, 10.0.0.2:6379",
+		"TEMPORAL_PROXY_VALKEY_PASSWORD":          "secret",
+		"TEMPORAL_PROXY_VALKEY_TLS_MODE":          TLSModePlaintext,
+		"TEMPORAL_PROXY_VALKEY_DIAL_TIMEOUT":      "3s",
+		"TEMPORAL_PROXY_VALKEY_READ_TIMEOUT":      "4s",
+		"TEMPORAL_PROXY_VALKEY_WRITE_TIMEOUT":     "5s",
+		"TEMPORAL_PROXY_TOKEN_CACHE_TTL":          "30m",
+		"TEMPORAL_PROXY_TOKEN_CACHE_MAX_SIZE":     "123",
+		"TEMPORAL_PROXY_UPSTREAM_TLS_SKIP_VERIFY": "false",
+		"TEMPORAL_PROXY_DOWNSTREAM_TLS_CERT_FILE": "",
+		"TEMPORAL_PROXY_DOWNSTREAM_TLS_KEY_FILE":  "",
+		"TEMPORAL_PROXY_UPSTREAM_TLS_SERVER_NAME": "",
+		"TEMPORAL_PROXY_UPSTREAM_TLS_CA_FILE":     "",
+		"TEMPORAL_PROXY_UPSTREAM_API_KEY":         "",
+		"TEMPORAL_PROXY_JWT_AUDIENCE":             "",
+		"TEMPORAL_PROXY_LISTEN_ADDR":              "127.0.0.1:7243",
+		"TEMPORAL_PROXY_UPSTREAM_ADDR":            "127.0.0.1:7233",
+		"TEMPORAL_PROXY_UPSTREAM_AUTH_MODE":       AuthModeNone,
+		"TEMPORAL_PROXY_UPSTREAM_TLS_MODE":        TLSModePlaintext,
+		"TEMPORAL_PROXY_DOWNSTREAM_TLS_MODE":      TLSModePlaintext,
+		"TEMPORAL_PROXY_AUTH_MODE":                WorkerAuthModeStatic,
+		"TEMPORAL_PROXY_LOG_LEVEL":                "info",
+		"TEMPORAL_PROXY_VALKEY_TLS_CA_FILE":       "",
+	}, func() {
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.TokenCacheBackend != TokenCacheBackendValkey {
+			t.Fatalf("unexpected backend: %s", cfg.TokenCacheBackend)
+		}
+		if len(cfg.Valkey.Addrs) != 2 || cfg.Valkey.Addrs[0] != "10.0.0.1:6379" || cfg.Valkey.Addrs[1] != "10.0.0.2:6379" {
+			t.Fatalf("unexpected addrs: %#v", cfg.Valkey.Addrs)
+		}
+		if cfg.Valkey.Password != "secret" {
+			t.Fatalf("unexpected password: %q", cfg.Valkey.Password)
+		}
+		if cfg.Valkey.TLSMode != TLSModePlaintext {
+			t.Fatalf("unexpected valkey tls mode: %s", cfg.Valkey.TLSMode)
+		}
+	})
+}
+
+func TestLoad_InvalidTokenCacheBackend(t *testing.T) {
+	withEnv(t, map[string]string{
+		"TEMPORAL_PROXY_STATIC_AUTH_FILE":    "/tmp/does-not-need-to-exist.json",
+		"TEMPORAL_PROXY_TOKEN_CACHE_BACKEND": "bogus",
+	}, func() {
+		_, err := Load()
+		if err == nil {
+			t.Fatalf("expected error for invalid token cache backend")
+		}
+	})
+}
+
+func TestLoad_InvalidValkeyTLSMode(t *testing.T) {
+	withEnv(t, map[string]string{
+		"TEMPORAL_PROXY_STATIC_AUTH_FILE": "/tmp/does-not-need-to-exist.json",
+		"TEMPORAL_PROXY_VALKEY_TLS_MODE":  "bogus",
+	}, func() {
+		_, err := Load()
+		if err == nil {
+			t.Fatalf("expected error for invalid valkey tls mode")
 		}
 	})
 }

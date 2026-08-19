@@ -39,7 +39,7 @@ func IdentityFromContext(ctx context.Context) (auth.Identity, bool) {
 // authentication, and namespace/task-queue/token scoping. It must run
 // before any handler - registering it via grpc.UnaryInterceptor on the
 // server that hosts proxy.Server guarantees that.
-func NewInterceptor(authenticator auth.Authenticator, cache *tokencache.Cache) grpc.UnaryServerInterceptor {
+func NewInterceptor(authenticator auth.Authenticator, cache tokencache.Store) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		rpcName := rpcNameFromFullMethod(info.FullMethod)
 
@@ -66,9 +66,9 @@ func NewInterceptor(authenticator auth.Authenticator, cache *tokencache.Cache) g
 			return nil, status.Error(codes.Internal, "proxy: request does not implement proto.Message")
 		}
 
-		if err := authorizeRequest(protoReq, rpcName, policy, identity, cache); err != nil {
+		if err := authorizeRequest(ctx, protoReq, rpcName, policy, identity, cache); err != nil {
 			slog.Warn("access denied", "rpc", rpcName, "subject", identity.Subject, "reason", err.Error())
-			return nil, status.Errorf(codes.PermissionDenied, "access denied: %s", err.Error())
+			return nil, grpcErrorForAuthorizationError(err)
 		}
 
 		ctx = context.WithValue(ctx, identityContextKey{}, identity)
@@ -82,12 +82,17 @@ func NewInterceptor(authenticator auth.Authenticator, cache *tokencache.Cache) g
 		// mutates token-cache state.
 		if policy.Terminal {
 			if token, ok := scope.RequestTaskToken(protoReq); ok {
-				cache.Delete(token)
+				if err := cache.Delete(ctx, token); err != nil {
+					slog.Warn("token cache delete failed after successful terminal RPC", "rpc", rpcName, "subject", identity.Subject, "error", err)
+				}
 			}
 		}
 		if protoResp, ok := resp.(proto.Message); ok {
 			for _, token := range scope.CollectResponseTaskTokens(protoResp) {
-				cache.Put(token, tokencache.Entry{Namespace: identity.Namespace, TaskQueue: identity.TaskQueue})
+				if err := cache.Put(ctx, token, tokencache.Entry{Namespace: identity.Namespace, TaskQueue: identity.TaskQueue}); err != nil {
+					slog.Error("token cache put failed after successful upstream RPC", "rpc", rpcName, "subject", identity.Subject, "error", err)
+					return nil, status.Error(codes.Unavailable, "token cache unavailable")
+				}
 			}
 		}
 
@@ -106,6 +111,26 @@ func NewInterceptor(authenticator auth.Authenticator, cache *tokencache.Cache) g
 
 		return resp, nil
 	}
+}
+
+type tokenCacheUnavailableError struct {
+	err error
+}
+
+func (e tokenCacheUnavailableError) Error() string {
+	return fmt.Sprintf("token cache unavailable: %v", e.err)
+}
+
+func (e tokenCacheUnavailableError) Unwrap() error {
+	return e.err
+}
+
+func grpcErrorForAuthorizationError(err error) error {
+	var cacheErr tokenCacheUnavailableError
+	if errors.As(err, &cacheErr) {
+		return status.Error(codes.Unavailable, "token cache unavailable")
+	}
+	return status.Errorf(codes.PermissionDenied, "access denied: %s", err.Error())
 }
 
 func rpcNameFromFullMethod(fullMethod string) string {
@@ -146,7 +171,7 @@ func extractAPIKey(ctx context.Context) (string, error) {
 // queue, per policy.Category, and - for RespondWorkflowTaskCompleted -
 // additionally validates that none of the request's commands target
 // anywhere else.
-func authorizeRequest(req proto.Message, rpcName string, policy rpcpolicy.Policy, identity auth.Identity, cache *tokencache.Cache) error {
+func authorizeRequest(ctx context.Context, req proto.Message, rpcName string, policy rpcpolicy.Policy, identity auth.Identity, cache tokencache.Store) error {
 	switch policy.Category {
 	case rpcpolicy.CategoryPoll:
 		ns, _ := scope.RequestNamespace(req)
@@ -185,7 +210,10 @@ func authorizeRequest(req proto.Message, rpcName string, policy rpcpolicy.Policy
 			return errors.New("missing task token")
 		}
 
-		entry, found := cache.Get(token)
+		entry, found, err := cache.Get(ctx, token)
+		if err != nil {
+			return tokenCacheUnavailableError{err: err}
+		}
 		if !found {
 			return errors.New("unknown or expired task token")
 		}

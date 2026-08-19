@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -23,6 +24,9 @@ const (
 
 	TLSModePlaintext = "plaintext"
 	TLSModeTLS       = "tls"
+
+	TokenCacheBackendLocal  = "local"
+	TokenCacheBackendValkey = "valkey"
 )
 
 // UpstreamConfig configures the proxy's connection to the real Temporal
@@ -48,6 +52,17 @@ type DownstreamConfig struct {
 	KeyFile  string
 }
 
+// ValkeyConfig configures the remote token-cache backend.
+type ValkeyConfig struct {
+	Addrs        []string
+	Password     string
+	TLSMode      string // TLSModePlaintext | TLSModeTLS
+	TLSCAFile    string
+	DialTimeout  time.Duration
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+}
+
 // Config is the fully validated proxy configuration.
 type Config struct {
 	Upstream   UpstreamConfig
@@ -59,8 +74,10 @@ type Config struct {
 	StaticAuthFile string
 	JWTAudience    string
 
+	TokenCacheBackend string
 	TokenCacheTTL     time.Duration
 	TokenCacheMaxSize int
+	Valkey            ValkeyConfig
 
 	LogLevel string
 }
@@ -89,7 +106,17 @@ func Load() (Config, error) {
 		WorkerAuthMode: getEnv("TEMPORAL_PROXY_AUTH_MODE", WorkerAuthModeStatic),
 		StaticAuthFile: getEnv("TEMPORAL_PROXY_STATIC_AUTH_FILE", defaultStaticAuthFile()),
 		JWTAudience:    os.Getenv("TEMPORAL_PROXY_JWT_AUDIENCE"),
-		LogLevel:       getEnv("TEMPORAL_PROXY_LOG_LEVEL", "info"),
+		TokenCacheBackend: getEnv(
+			"TEMPORAL_PROXY_TOKEN_CACHE_BACKEND",
+			TokenCacheBackendLocal,
+		),
+		Valkey: ValkeyConfig{
+			Addrs:     getEnvList("TEMPORAL_PROXY_VALKEY_ADDRS"),
+			Password:  os.Getenv("TEMPORAL_PROXY_VALKEY_PASSWORD"),
+			TLSMode:   getEnv("TEMPORAL_PROXY_VALKEY_TLS_MODE", TLSModeTLS),
+			TLSCAFile: os.Getenv("TEMPORAL_PROXY_VALKEY_TLS_CA_FILE"),
+		},
+		LogLevel: getEnv("TEMPORAL_PROXY_LOG_LEVEL", "info"),
 	}
 
 	var errs []error
@@ -111,6 +138,24 @@ func Load() (Config, error) {
 		errs = append(errs, err)
 	}
 	cfg.TokenCacheMaxSize = maxSize
+
+	valkeyDialTimeout, err := getEnvDuration("TEMPORAL_PROXY_VALKEY_DIAL_TIMEOUT", 5*time.Second)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	cfg.Valkey.DialTimeout = valkeyDialTimeout
+
+	valkeyReadTimeout, err := getEnvDuration("TEMPORAL_PROXY_VALKEY_READ_TIMEOUT", 2*time.Second)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	cfg.Valkey.ReadTimeout = valkeyReadTimeout
+
+	valkeyWriteTimeout, err := getEnvDuration("TEMPORAL_PROXY_VALKEY_WRITE_TIMEOUT", 2*time.Second)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	cfg.Valkey.WriteTimeout = valkeyWriteTimeout
 
 	errs = append(errs, cfg.validate()...)
 
@@ -171,6 +216,32 @@ func (c Config) validate() []error {
 		errs = append(errs, errors.New("TEMPORAL_PROXY_TOKEN_CACHE_MAX_SIZE must be positive"))
 	}
 
+	switch c.TokenCacheBackend {
+	case TokenCacheBackendLocal:
+	case TokenCacheBackendValkey:
+		if len(c.Valkey.Addrs) == 0 {
+			errs = append(errs, errors.New("TEMPORAL_PROXY_VALKEY_ADDRS is required when TEMPORAL_PROXY_TOKEN_CACHE_BACKEND=valkey"))
+		}
+	default:
+		errs = append(errs, fmt.Errorf("TEMPORAL_PROXY_TOKEN_CACHE_BACKEND: invalid value %q (want %q or %q)", c.TokenCacheBackend, TokenCacheBackendLocal, TokenCacheBackendValkey))
+	}
+
+	switch c.Valkey.TLSMode {
+	case TLSModePlaintext, TLSModeTLS:
+	default:
+		errs = append(errs, fmt.Errorf("TEMPORAL_PROXY_VALKEY_TLS_MODE: invalid value %q (want %q or %q)", c.Valkey.TLSMode, TLSModePlaintext, TLSModeTLS))
+	}
+
+	if c.Valkey.DialTimeout <= 0 {
+		errs = append(errs, errors.New("TEMPORAL_PROXY_VALKEY_DIAL_TIMEOUT must be positive"))
+	}
+	if c.Valkey.ReadTimeout <= 0 {
+		errs = append(errs, errors.New("TEMPORAL_PROXY_VALKEY_READ_TIMEOUT must be positive"))
+	}
+	if c.Valkey.WriteTimeout <= 0 {
+		errs = append(errs, errors.New("TEMPORAL_PROXY_VALKEY_WRITE_TIMEOUT must be positive"))
+	}
+
 	return errs
 }
 
@@ -191,6 +262,22 @@ func getEnv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func getEnvList(key string) []string {
+	v, ok := os.LookupEnv(key)
+	if !ok {
+		return nil
+	}
+
+	parts := strings.Split(v, ",")
+	values := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if value := strings.TrimSpace(part); value != "" {
+			values = append(values, value)
+		}
+	}
+	return values
 }
 
 func getEnvBool(key string, def bool) (bool, error) {
