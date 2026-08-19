@@ -29,12 +29,13 @@ before any request is forwarded. For each incoming call it:
 1. **Allowlists the RPC.** Only the methods in `internal/rpcpolicy/allowlist.go` are permitted; every
    other RPC is rejected with `PermissionDenied` before a handler runs. The allowed set is the
    worker task-processing surface:
-   - `PollWorkflowTaskQueue`, `PollActivityTaskQueue`
+   - `PollWorkflowTaskQueue`, `PollActivityTaskQueue`, `PollNexusTaskQueue`
    - `RespondWorkflowTaskCompleted`, `RespondWorkflowTaskFailed`
    - `RespondActivityTaskCompleted`, `RespondActivityTaskFailed`, `RespondActivityTaskCanceled`
+   - `RespondNexusTaskCompleted`, `RespondNexusTaskFailed`
    - `RecordActivityTaskHeartbeat`, `RespondQueryTaskCompleted`
    - `GetSystemInfo`, `DescribeNamespace` (needed by the SDK at worker startup)
-   - `ShutdownWorker`
+   - `ShutdownWorker`, `RecordWorkerHeartbeat`
 
 2. **Authenticates** the caller from the `authorization: Bearer <credential>` metadata (the same
    convention the Temporal SDK's API-key credential uses) and resolves it to an `Identity`
@@ -43,8 +44,13 @@ before any request is forwarded. For each incoming call it:
 3. **Scopes** the request to that identity (`internal/scope`):
    - Poll RPCs must target the identity's namespace + task queue (sticky queues are authorized by
      their self-declared normal-queue name).
-   - Token RPCs (Respond*/Heartbeat) must present a task token the proxy previously handed out for
-     this identity — tracked in an in-memory **token cache** (`internal/tokencache`).
+   - Token RPCs (`Respond*`, `RecordActivityTaskHeartbeat`) must present a task token the proxy
+     previously handed out for this identity — tracked in an in-memory **token cache**
+     (`internal/tokencache`).
+   - `PollNexusTaskQueue` also validates embedded worker heartbeat entries against the identity's
+     task queue before forwarding.
+   - `RecordWorkerHeartbeat` must target the identity's namespace, and every reported heartbeat entry
+     must target the identity's task queue.
    - `RespondWorkflowTaskCompleted` additionally has every emitted **command** validated so a
      workflow cannot schedule activities / child workflows / continue-as-new onto another queue or
      namespace.

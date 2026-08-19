@@ -24,6 +24,9 @@ const (
 	// it must match the caller's authorized queue; any sticky queue name they
 	// also carry is a per-worker unguessable identifier and is not checked.
 	CategoryWorker
+	// CategoryWorkerHeartbeat requests carry an explicit namespace and a batch
+	// of WorkerHeartbeat entries, each with its own normal task queue name.
+	CategoryWorkerHeartbeat
 )
 
 // Policy describes how the proxy should treat one allowed RPC.
@@ -52,12 +55,15 @@ type Policy struct {
 var Allowed = map[string]Policy{
 	"PollWorkflowTaskQueue":        {Category: CategoryPoll},
 	"PollActivityTaskQueue":        {Category: CategoryPoll},
+	"PollNexusTaskQueue":           {Category: CategoryPoll},
 	"RespondWorkflowTaskCompleted": {Category: CategoryToken, Terminal: true},
 	"RespondWorkflowTaskFailed":    {Category: CategoryToken, Terminal: true},
 	"RecordActivityTaskHeartbeat":  {Category: CategoryToken, Terminal: false},
 	"RespondActivityTaskCompleted": {Category: CategoryToken, Terminal: true},
 	"RespondActivityTaskFailed":    {Category: CategoryToken, Terminal: true},
 	"RespondActivityTaskCanceled":  {Category: CategoryToken, Terminal: true},
+	"RespondNexusTaskCompleted":    {Category: CategoryToken, Terminal: true},
+	"RespondNexusTaskFailed":       {Category: CategoryToken, Terminal: true},
 	// RespondQueryTaskCompleted reuses the same task token issued in the
 	// originating PollWorkflowTaskQueueResponse for the workflow task that
 	// carried the legacy query, so it must not evict the token - a later
@@ -78,4 +84,8 @@ var Allowed = map[string]Policy{
 	// caller's identity so a worker can't cancel another queue's polls. It has
 	// no task token, so it is not terminal.
 	"ShutdownWorker": {Category: CategoryWorker},
+	// RecordWorkerHeartbeat updates server-side worker liveness/telemetry. It
+	// carries no task token, so every reported heartbeat entry is scoped by its
+	// explicit task queue instead.
+	"RecordWorkerHeartbeat": {Category: CategoryWorkerHeartbeat},
 }

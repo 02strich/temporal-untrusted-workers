@@ -6,6 +6,7 @@ import (
 	commandpb "go.temporal.io/api/command/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
+	workerpb "go.temporal.io/api/worker/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"google.golang.org/protobuf/proto"
 )
@@ -16,6 +17,9 @@ func TestRequestNamespace(t *testing.T) {
 	}
 	if ns, ok := RequestNamespace(&workflowservice.PollActivityTaskQueueRequest{Namespace: "ns-a"}); !ok || ns != "ns-a" {
 		t.Fatalf("PollActivityTaskQueueRequest: got (%q, %v)", ns, ok)
+	}
+	if ns, ok := RequestNamespace(&workflowservice.PollNexusTaskQueueRequest{Namespace: "ns-a"}); !ok || ns != "ns-a" {
+		t.Fatalf("PollNexusTaskQueueRequest: got (%q, %v)", ns, ok)
 	}
 	if ns, ok := RequestNamespace(&workflowservice.RespondWorkflowTaskCompletedRequest{Namespace: "ns-a"}); !ok || ns != "ns-a" {
 		t.Fatalf("RespondWorkflowTaskCompletedRequest: got (%q, %v)", ns, ok)
@@ -38,11 +42,20 @@ func TestRequestNamespace(t *testing.T) {
 	if ns, ok := RequestNamespace(&workflowservice.RespondQueryTaskCompletedRequest{Namespace: "ns-a"}); !ok || ns != "ns-a" {
 		t.Fatalf("RespondQueryTaskCompletedRequest: got (%q, %v)", ns, ok)
 	}
+	if ns, ok := RequestNamespace(&workflowservice.RespondNexusTaskCompletedRequest{Namespace: "ns-a"}); !ok || ns != "ns-a" {
+		t.Fatalf("RespondNexusTaskCompletedRequest: got (%q, %v)", ns, ok)
+	}
+	if ns, ok := RequestNamespace(&workflowservice.RespondNexusTaskFailedRequest{Namespace: "ns-a"}); !ok || ns != "ns-a" {
+		t.Fatalf("RespondNexusTaskFailedRequest: got (%q, %v)", ns, ok)
+	}
 	if ns, ok := RequestNamespace(&workflowservice.DescribeNamespaceRequest{Namespace: "ns-a"}); !ok || ns != "ns-a" {
 		t.Fatalf("DescribeNamespaceRequest: got (%q, %v)", ns, ok)
 	}
 	if ns, ok := RequestNamespace(&workflowservice.ShutdownWorkerRequest{Namespace: "ns-a"}); !ok || ns != "ns-a" {
 		t.Fatalf("ShutdownWorkerRequest: got (%q, %v)", ns, ok)
+	}
+	if ns, ok := RequestNamespace(&workflowservice.RecordWorkerHeartbeatRequest{Namespace: "ns-a"}); !ok || ns != "ns-a" {
+		t.Fatalf("RecordWorkerHeartbeatRequest: got (%q, %v)", ns, ok)
 	}
 
 	if _, ok := RequestNamespace(&workflowservice.GetSystemInfoRequest{}); ok {
@@ -84,7 +97,7 @@ func TestRequestTaskQueueName(t *testing.T) {
 	}
 }
 
-func TestRequestTaskQueue_StickyKindAndNormalName(t *testing.T) {
+func TestRequestTaskQueue(t *testing.T) {
 	req := &workflowservice.PollWorkflowTaskQueueRequest{
 		Namespace: "ns-a",
 		TaskQueue: &taskqueuepb.TaskQueue{
@@ -99,6 +112,15 @@ func TestRequestTaskQueue_StickyKindAndNormalName(t *testing.T) {
 	}
 	if tq.GetKind() != enumspb.TASK_QUEUE_KIND_STICKY || tq.GetNormalName() != "queue-a" {
 		t.Fatalf("unexpected task queue: %+v", tq)
+	}
+
+	nexus := &workflowservice.PollNexusTaskQueueRequest{
+		Namespace: "ns-a",
+		TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-a"},
+	}
+	tq, ok = RequestTaskQueue(nexus)
+	if !ok || tq.GetName() != "queue-a" {
+		t.Fatalf("PollNexusTaskQueueRequest: got (%+v, %v)", tq, ok)
 	}
 
 	if _, ok := RequestTaskQueue(&workflowservice.RespondActivityTaskCompletedRequest{}); ok {
@@ -117,6 +139,8 @@ func TestRequestTaskToken(t *testing.T) {
 		{name: "RespondActivityTaskFailed", req: &workflowservice.RespondActivityTaskFailedRequest{TaskToken: token}},
 		{name: "RespondActivityTaskCanceled", req: &workflowservice.RespondActivityTaskCanceledRequest{TaskToken: token}},
 		{name: "RespondQueryTaskCompleted", req: &workflowservice.RespondQueryTaskCompletedRequest{TaskToken: token}},
+		{name: "RespondNexusTaskCompleted", req: &workflowservice.RespondNexusTaskCompletedRequest{TaskToken: token}},
+		{name: "RespondNexusTaskFailed", req: &workflowservice.RespondNexusTaskFailedRequest{TaskToken: token}},
 	}
 
 	for _, c := range cases {
@@ -128,6 +152,49 @@ func TestRequestTaskToken(t *testing.T) {
 
 	if _, ok := RequestTaskToken(&workflowservice.PollWorkflowTaskQueueRequest{}); ok {
 		t.Fatalf("poll RPC should not match RequestTaskToken")
+	}
+}
+
+func TestValidateWorkerHeartbeatTaskQueues(t *testing.T) {
+	if err := ValidateWorkerHeartbeatTaskQueues(
+		[]*workerpb.WorkerHeartbeat{
+			{TaskQueue: "queue-a"},
+			{TaskQueue: "queue-a"},
+		},
+		"queue-a",
+	); err != nil {
+		t.Fatalf("expected matching heartbeats to pass, got %v", err)
+	}
+
+	if err := ValidateWorkerHeartbeatTaskQueues(nil, "queue-a"); err != nil {
+		t.Fatalf("expected empty heartbeat batch to pass, got %v", err)
+	}
+
+	if err := ValidateWorkerHeartbeatTaskQueues(
+		[]*workerpb.WorkerHeartbeat{
+			{TaskQueue: "queue-b"},
+		},
+		"queue-a",
+	); err == nil {
+		t.Fatalf("expected cross-queue heartbeat to fail")
+	}
+
+	if err := ValidateWorkerHeartbeatTaskQueues(
+		[]*workerpb.WorkerHeartbeat{
+			{},
+		},
+		"queue-a",
+	); err == nil {
+		t.Fatalf("expected heartbeat with empty task queue to fail")
+	}
+
+	if err := ValidateWorkerHeartbeatTaskQueues(
+		[]*workerpb.WorkerHeartbeat{
+			nil,
+		},
+		"queue-a",
+	); err == nil {
+		t.Fatalf("expected nil heartbeat entry to fail")
 	}
 }
 
@@ -146,11 +213,17 @@ func TestCollectResponseTaskTokens_Poll(t *testing.T) {
 	if got := CollectResponseTaskTokens(&workflowservice.PollActivityTaskQueueResponse{TaskToken: tok}); len(got) != 1 || string(got[0]) != string(tok) {
 		t.Fatalf("unexpected tokens: %v", got)
 	}
+	if got := CollectResponseTaskTokens(&workflowservice.PollNexusTaskQueueResponse{TaskToken: tok}); len(got) != 1 || string(got[0]) != string(tok) {
+		t.Fatalf("unexpected tokens: %v", got)
+	}
 
 	// An empty poll response (no task available - the common long-poll
 	// timeout case) must not yield a token.
 	if got := CollectResponseTaskTokens(&workflowservice.PollWorkflowTaskQueueResponse{}); len(got) != 0 {
 		t.Fatalf("expected no tokens for empty poll response, got %v", got)
+	}
+	if got := CollectResponseTaskTokens(&workflowservice.PollNexusTaskQueueResponse{}); len(got) != 0 {
+		t.Fatalf("expected no tokens for empty nexus poll response, got %v", got)
 	}
 }
 

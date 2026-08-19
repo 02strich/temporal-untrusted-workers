@@ -169,6 +169,11 @@ func authorizeRequest(req proto.Message, rpcName string, policy rpcpolicy.Policy
 		} else if tq.GetName() != identity.TaskQueue {
 			return fmt.Errorf("task queue %q not authorized for this identity", tq.GetName())
 		}
+		if r, ok := req.(*workflowservice.PollNexusTaskQueueRequest); ok {
+			if err := scope.ValidateWorkerHeartbeatTaskQueues(r.GetWorkerHeartbeat(), identity.TaskQueue); err != nil {
+				return err
+			}
+		}
 
 	case rpcpolicy.CategoryToken:
 		if ns, ok := scope.RequestNamespace(req); ok && ns != identity.Namespace {
@@ -208,6 +213,19 @@ func authorizeRequest(req proto.Message, rpcName string, policy rpcpolicy.Policy
 		// name (if any) needs no check, mirroring the sticky Poll case.
 		if tq, ok := scope.RequestTaskQueueName(req); ok && tq != "" && tq != identity.TaskQueue {
 			return fmt.Errorf("task queue %q not authorized for this identity", tq)
+		}
+
+	case rpcpolicy.CategoryWorkerHeartbeat:
+		ns, _ := scope.RequestNamespace(req)
+		if ns != identity.Namespace {
+			return fmt.Errorf("namespace %q not authorized for this identity", ns)
+		}
+		r, ok := req.(*workflowservice.RecordWorkerHeartbeatRequest)
+		if !ok {
+			return errors.New("invalid worker heartbeat request")
+		}
+		if err := scope.ValidateWorkerHeartbeatTaskQueues(r.GetWorkerHeartbeat(), identity.TaskQueue); err != nil {
+			return err
 		}
 	}
 

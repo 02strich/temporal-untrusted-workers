@@ -15,6 +15,7 @@ import (
 
 	commandpb "go.temporal.io/api/command/v1"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
+	workerpb "go.temporal.io/api/worker/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"google.golang.org/protobuf/proto"
 )
@@ -26,6 +27,8 @@ func RequestNamespace(req proto.Message) (string, bool) {
 	case *workflowservice.PollWorkflowTaskQueueRequest:
 		return r.GetNamespace(), true
 	case *workflowservice.PollActivityTaskQueueRequest:
+		return r.GetNamespace(), true
+	case *workflowservice.PollNexusTaskQueueRequest:
 		return r.GetNamespace(), true
 	case *workflowservice.RespondWorkflowTaskCompletedRequest:
 		return r.GetNamespace(), true
@@ -41,9 +44,15 @@ func RequestNamespace(req proto.Message) (string, bool) {
 		return r.GetNamespace(), true
 	case *workflowservice.RespondQueryTaskCompletedRequest:
 		return r.GetNamespace(), true
+	case *workflowservice.RespondNexusTaskCompletedRequest:
+		return r.GetNamespace(), true
+	case *workflowservice.RespondNexusTaskFailedRequest:
+		return r.GetNamespace(), true
 	case *workflowservice.DescribeNamespaceRequest:
 		return r.GetNamespace(), true
 	case *workflowservice.ShutdownWorkerRequest:
+		return r.GetNamespace(), true
+	case *workflowservice.RecordWorkerHeartbeatRequest:
 		return r.GetNamespace(), true
 	default:
 		return "", false
@@ -51,10 +60,10 @@ func RequestNamespace(req proto.Message) (string, bool) {
 }
 
 // RequestTaskQueueName returns the task queue name carried by a request of
-// one of the two Poll RPCs or of ShutdownWorker. ShutdownWorker carries the
-// normal queue name directly as a string (not a TaskQueue message), and that
-// name may legitimately be empty - the second return value reports only that
-// the RPC has such a field, not that it is set.
+// the workflow/activity Poll RPCs or of ShutdownWorker. ShutdownWorker
+// carries the normal queue name directly as a string (not a TaskQueue
+// message), and that name may legitimately be empty - the second return value
+// reports only that the RPC has such a field, not that it is set.
 func RequestTaskQueueName(req proto.Message) (string, bool) {
 	switch r := req.(type) {
 	case *workflowservice.PollWorkflowTaskQueueRequest:
@@ -68,9 +77,9 @@ func RequestTaskQueueName(req proto.Message) (string, bool) {
 	}
 }
 
-// RequestTaskQueue returns the full TaskQueue message (name, kind, and -
-// for sticky queues - the real "normal" queue name it belongs to) carried
-// by a request of one of the two Poll RPCs.
+// RequestTaskQueue returns the full TaskQueue message (name, kind, and - for
+// sticky queues - the real "normal" queue name it belongs to) carried by a
+// request of one of the Poll RPCs.
 //
 // A worker with sticky execution enabled (the SDK default) polls not only
 // its configured task queue but also a per-process sticky queue, whose Name
@@ -88,6 +97,8 @@ func RequestTaskQueue(req proto.Message) (*taskqueuepb.TaskQueue, bool) {
 	case *workflowservice.PollWorkflowTaskQueueRequest:
 		return r.GetTaskQueue(), true
 	case *workflowservice.PollActivityTaskQueueRequest:
+		return r.GetTaskQueue(), true
+	case *workflowservice.PollNexusTaskQueueRequest:
 		return r.GetTaskQueue(), true
 	default:
 		return nil, false
@@ -112,13 +123,17 @@ func RequestTaskToken(req proto.Message) ([]byte, bool) {
 		return r.GetTaskToken(), true
 	case *workflowservice.RespondQueryTaskCompletedRequest:
 		return r.GetTaskToken(), true
+	case *workflowservice.RespondNexusTaskCompletedRequest:
+		return r.GetTaskToken(), true
+	case *workflowservice.RespondNexusTaskFailedRequest:
+		return r.GetTaskToken(), true
 	default:
 		return nil, false
 	}
 }
 
 // CollectResponseTaskTokens returns every task token embedded in a response
-// of an allowed RPC: the direct token on the two Poll responses, and - for
+// of an allowed RPC: the direct token on Poll responses, and - for
 // RespondWorkflowTaskCompletedResponse specifically - the new tokens Temporal
 // embeds for eager/sticky dispatch (a new workflow task, and/or eagerly
 // dispatched activity tasks). Every token returned here should be registered
@@ -135,6 +150,10 @@ func CollectResponseTaskTokens(resp proto.Message) [][]byte {
 		if tok := r.GetTaskToken(); len(tok) > 0 {
 			return [][]byte{tok}
 		}
+	case *workflowservice.PollNexusTaskQueueResponse:
+		if tok := r.GetTaskToken(); len(tok) > 0 {
+			return [][]byte{tok}
+		}
 	case *workflowservice.RespondWorkflowTaskCompletedResponse:
 		var tokens [][]byte
 		if wt := r.GetWorkflowTask(); wt != nil {
@@ -148,6 +167,21 @@ func CollectResponseTaskTokens(resp proto.Message) [][]byte {
 			}
 		}
 		return tokens
+	}
+	return nil
+}
+
+// ValidateWorkerHeartbeatTaskQueues checks every heartbeat entry against the
+// caller's authorized task queue.
+func ValidateWorkerHeartbeatTaskQueues(heartbeats []*workerpb.WorkerHeartbeat, taskQueue string) error {
+	for i, hb := range heartbeats {
+		tq := hb.GetTaskQueue()
+		if tq == "" {
+			return fmt.Errorf("worker_heartbeat[%d] missing task queue", i)
+		}
+		if tq != taskQueue {
+			return fmt.Errorf("worker_heartbeat[%d] targets task queue %q, not authorized queue %q", i, tq, taskQueue)
+		}
 	}
 	return nil
 }

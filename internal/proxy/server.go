@@ -28,6 +28,10 @@ func (s *Server) PollActivityTaskQueue(ctx context.Context, req *workflowservice
 	return s.Upstream.PollActivityTaskQueue(ctx, req)
 }
 
+func (s *Server) PollNexusTaskQueue(ctx context.Context, req *workflowservice.PollNexusTaskQueueRequest) (*workflowservice.PollNexusTaskQueueResponse, error) {
+	return s.Upstream.PollNexusTaskQueue(ctx, req)
+}
+
 func (s *Server) RespondWorkflowTaskCompleted(ctx context.Context, req *workflowservice.RespondWorkflowTaskCompletedRequest) (*workflowservice.RespondWorkflowTaskCompletedResponse, error) {
 	return s.Upstream.RespondWorkflowTaskCompleted(ctx, req)
 }
@@ -52,6 +56,14 @@ func (s *Server) RespondActivityTaskCanceled(ctx context.Context, req *workflows
 	return s.Upstream.RespondActivityTaskCanceled(ctx, req)
 }
 
+func (s *Server) RespondNexusTaskCompleted(ctx context.Context, req *workflowservice.RespondNexusTaskCompletedRequest) (*workflowservice.RespondNexusTaskCompletedResponse, error) {
+	return s.Upstream.RespondNexusTaskCompleted(ctx, req)
+}
+
+func (s *Server) RespondNexusTaskFailed(ctx context.Context, req *workflowservice.RespondNexusTaskFailedRequest) (*workflowservice.RespondNexusTaskFailedResponse, error) {
+	return s.Upstream.RespondNexusTaskFailed(ctx, req)
+}
+
 func (s *Server) RespondQueryTaskCompleted(ctx context.Context, req *workflowservice.RespondQueryTaskCompletedRequest) (*workflowservice.RespondQueryTaskCompletedResponse, error) {
 	return s.Upstream.RespondQueryTaskCompleted(ctx, req)
 }
@@ -66,4 +78,8 @@ func (s *Server) DescribeNamespace(ctx context.Context, req *workflowservice.Des
 
 func (s *Server) ShutdownWorker(ctx context.Context, req *workflowservice.ShutdownWorkerRequest) (*workflowservice.ShutdownWorkerResponse, error) {
 	return s.Upstream.ShutdownWorker(ctx, req)
+}
+
+func (s *Server) RecordWorkerHeartbeat(ctx context.Context, req *workflowservice.RecordWorkerHeartbeatRequest) (*workflowservice.RecordWorkerHeartbeatResponse, error) {
+	return s.Upstream.RecordWorkerHeartbeat(ctx, req)
 }

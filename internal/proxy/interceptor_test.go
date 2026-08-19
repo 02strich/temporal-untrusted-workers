@@ -12,6 +12,7 @@ import (
 	commandpb "go.temporal.io/api/command/v1"
 	enums "go.temporal.io/api/enums/v1"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
+	workerpb "go.temporal.io/api/worker/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -142,6 +143,136 @@ func TestInterceptor_PollAllowsMatchingQueue(t *testing.T) {
 	}
 }
 
+const pollNexusMethod = "/temporal.api.workflowservice.v1.WorkflowService/PollNexusTaskQueue"
+
+func TestInterceptor_PollNexusAllowsMatchingQueueAndCachesToken(t *testing.T) {
+	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
+		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+	}}
+	cache := tokencache.New(time.Hour, 1000)
+	defer cache.Close()
+	interceptor := NewInterceptor(authr, cache)
+
+	req := &workflowservice.PollNexusTaskQueueRequest{
+		Namespace: "ns",
+		TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-a"},
+		WorkerHeartbeat: []*workerpb.WorkerHeartbeat{
+			{TaskQueue: "queue-a"},
+		},
+	}
+	resp, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
+		pollNexusMethod,
+		req, &workflowservice.PollNexusTaskQueueResponse{TaskToken: []byte("nexus-tok-1")}, nil)
+
+	if !called {
+		t.Fatalf("handler should have run for an authorized nexus poll")
+	}
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.(*workflowservice.PollNexusTaskQueueResponse).GetTaskToken() == nil {
+		t.Fatalf("expected response to pass through")
+	}
+
+	entry, ok := cache.Get([]byte("nexus-tok-1"))
+	if !ok || entry.Namespace != "ns" || entry.TaskQueue != "queue-a" {
+		t.Fatalf("expected nexus token to be cached for the polling identity, got %+v (found=%v)", entry, ok)
+	}
+}
+
+func TestInterceptor_PollNexusAllowsEmptyWorkerHeartbeatBatch(t *testing.T) {
+	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
+		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+	}}
+	cache := tokencache.New(time.Hour, 1000)
+	defer cache.Close()
+	interceptor := NewInterceptor(authr, cache)
+
+	req := &workflowservice.PollNexusTaskQueueRequest{
+		Namespace: "ns",
+		TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-a"},
+	}
+	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
+		pollNexusMethod,
+		req, &workflowservice.PollNexusTaskQueueResponse{}, nil)
+
+	if !called {
+		t.Fatalf("handler should have run for a nexus poll with no worker heartbeat entries")
+	}
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestInterceptor_PollNexusDeniesWrongQueue(t *testing.T) {
+	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
+		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+	}}
+	cache := tokencache.New(time.Hour, 1000)
+	defer cache.Close()
+	interceptor := NewInterceptor(authr, cache)
+
+	req := &workflowservice.PollNexusTaskQueueRequest{Namespace: "ns", TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-b"}}
+	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
+		pollNexusMethod,
+		req, &workflowservice.PollNexusTaskQueueResponse{}, nil)
+
+	if called {
+		t.Fatalf("handler must not run for a cross-queue nexus poll")
+	}
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied, got %v", err)
+	}
+}
+
+func TestInterceptor_PollNexusDeniesWrongNamespace(t *testing.T) {
+	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
+		"key-a": {Valid: true, Namespace: "ns-a", TaskQueue: "queue-a"},
+	}}
+	cache := tokencache.New(time.Hour, 1000)
+	defer cache.Close()
+	interceptor := NewInterceptor(authr, cache)
+
+	req := &workflowservice.PollNexusTaskQueueRequest{Namespace: "ns-b", TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-a"}}
+	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
+		pollNexusMethod,
+		req, &workflowservice.PollNexusTaskQueueResponse{}, nil)
+
+	if called {
+		t.Fatalf("handler must not run for a cross-namespace nexus poll")
+	}
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied, got %v", err)
+	}
+}
+
+func TestInterceptor_PollNexusDeniesWrongWorkerHeartbeatQueue(t *testing.T) {
+	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
+		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+	}}
+	cache := tokencache.New(time.Hour, 1000)
+	defer cache.Close()
+	interceptor := NewInterceptor(authr, cache)
+
+	req := &workflowservice.PollNexusTaskQueueRequest{
+		Namespace: "ns",
+		TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-a"},
+		WorkerHeartbeat: []*workerpb.WorkerHeartbeat{
+			{TaskQueue: "victim-queue"},
+		},
+	}
+	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
+		pollNexusMethod,
+		req, &workflowservice.PollNexusTaskQueueResponse{}, nil)
+
+	if called {
+		t.Fatalf("handler must not run for a nexus poll reporting another queue's heartbeat")
+	}
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied, got %v", err)
+	}
+}
+
 const shutdownWorkerMethod = "/temporal.api.workflowservice.v1.WorkflowService/ShutdownWorker"
 
 func shutdownInterceptor(t *testing.T) grpc.UnaryServerInterceptor {
@@ -202,6 +333,114 @@ func TestInterceptor_ShutdownWorkerDeniesOtherNamespace(t *testing.T) {
 
 	if called {
 		t.Fatalf("handler must not run for a ShutdownWorker in another namespace")
+	}
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied, got %v", err)
+	}
+}
+
+const recordWorkerHeartbeatMethod = "/temporal.api.workflowservice.v1.WorkflowService/RecordWorkerHeartbeat"
+
+func TestInterceptor_RecordWorkerHeartbeatAllowsMatchingQueue(t *testing.T) {
+	req := &workflowservice.RecordWorkerHeartbeatRequest{
+		Namespace: "ns",
+		WorkerHeartbeat: []*workerpb.WorkerHeartbeat{
+			{TaskQueue: "queue-a"},
+		},
+		ResourceId: "worker-group:queue-a",
+	}
+	_, err, called := callInterceptor(t, shutdownInterceptor(t), ctxWithBearer("key-a"),
+		recordWorkerHeartbeatMethod, req, &workflowservice.RecordWorkerHeartbeatResponse{}, nil)
+
+	if !called {
+		t.Fatalf("handler should have run for an authorized RecordWorkerHeartbeat")
+	}
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestInterceptor_RecordWorkerHeartbeatAllowsMultipleMatchingHeartbeats(t *testing.T) {
+	req := &workflowservice.RecordWorkerHeartbeatRequest{
+		Namespace: "ns",
+		WorkerHeartbeat: []*workerpb.WorkerHeartbeat{
+			{TaskQueue: "queue-a", WorkerIdentity: "worker-1"},
+			{TaskQueue: "queue-a", WorkerIdentity: "worker-2"},
+		},
+	}
+	_, err, called := callInterceptor(t, shutdownInterceptor(t), ctxWithBearer("key-a"),
+		recordWorkerHeartbeatMethod, req, &workflowservice.RecordWorkerHeartbeatResponse{}, nil)
+
+	if !called {
+		t.Fatalf("handler should have run for matching RecordWorkerHeartbeat entries")
+	}
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestInterceptor_RecordWorkerHeartbeatAllowsEmptyBatch(t *testing.T) {
+	req := &workflowservice.RecordWorkerHeartbeatRequest{Namespace: "ns"}
+	_, err, called := callInterceptor(t, shutdownInterceptor(t), ctxWithBearer("key-a"),
+		recordWorkerHeartbeatMethod, req, &workflowservice.RecordWorkerHeartbeatResponse{}, nil)
+
+	if !called {
+		t.Fatalf("handler should have run for an empty RecordWorkerHeartbeat batch")
+	}
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestInterceptor_RecordWorkerHeartbeatDeniesOtherNamespace(t *testing.T) {
+	req := &workflowservice.RecordWorkerHeartbeatRequest{
+		Namespace: "other-ns",
+		WorkerHeartbeat: []*workerpb.WorkerHeartbeat{
+			{TaskQueue: "queue-a"},
+		},
+	}
+	_, err, called := callInterceptor(t, shutdownInterceptor(t), ctxWithBearer("key-a"),
+		recordWorkerHeartbeatMethod, req, &workflowservice.RecordWorkerHeartbeatResponse{}, nil)
+
+	if called {
+		t.Fatalf("handler must not run for a RecordWorkerHeartbeat in another namespace")
+	}
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied, got %v", err)
+	}
+}
+
+func TestInterceptor_RecordWorkerHeartbeatDeniesOtherQueue(t *testing.T) {
+	req := &workflowservice.RecordWorkerHeartbeatRequest{
+		Namespace: "ns",
+		WorkerHeartbeat: []*workerpb.WorkerHeartbeat{
+			{TaskQueue: "queue-a"},
+			{TaskQueue: "victim-queue"},
+		},
+	}
+	_, err, called := callInterceptor(t, shutdownInterceptor(t), ctxWithBearer("key-a"),
+		recordWorkerHeartbeatMethod, req, &workflowservice.RecordWorkerHeartbeatResponse{}, nil)
+
+	if called {
+		t.Fatalf("handler must not run for a RecordWorkerHeartbeat targeting another queue")
+	}
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied, got %v", err)
+	}
+}
+
+func TestInterceptor_RecordWorkerHeartbeatDeniesEmptyQueue(t *testing.T) {
+	req := &workflowservice.RecordWorkerHeartbeatRequest{
+		Namespace: "ns",
+		WorkerHeartbeat: []*workerpb.WorkerHeartbeat{
+			{},
+		},
+	}
+	_, err, called := callInterceptor(t, shutdownInterceptor(t), ctxWithBearer("key-a"),
+		recordWorkerHeartbeatMethod, req, &workflowservice.RecordWorkerHeartbeatResponse{}, nil)
+
+	if called {
+		t.Fatalf("handler must not run for a RecordWorkerHeartbeat with an empty task queue")
 	}
 	if status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("expected PermissionDenied, got %v", err)
@@ -297,6 +536,85 @@ func TestInterceptor_TokenScoping(t *testing.T) {
 	}
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestInterceptor_NexusResponsesUseTokenScoping(t *testing.T) {
+	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
+		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-b": {Valid: true, Namespace: "ns", TaskQueue: "queue-b"},
+	}}
+	cache := tokencache.New(time.Hour, 1000)
+	defer cache.Close()
+	interceptor := NewInterceptor(authr, cache)
+
+	cache.Put([]byte("nexus-tok-a"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
+
+	req := &workflowservice.RespondNexusTaskCompletedRequest{Namespace: "ns", TaskToken: []byte("nexus-tok-a")}
+	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-b"),
+		"/temporal.api.workflowservice.v1.WorkflowService/RespondNexusTaskCompleted",
+		req, &workflowservice.RespondNexusTaskCompletedResponse{}, nil)
+	if called {
+		t.Fatalf("handler must not run for a nexus token bound to a different identity")
+	}
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied, got %v", err)
+	}
+
+	req2 := &workflowservice.RespondNexusTaskFailedRequest{Namespace: "ns", TaskToken: []byte("never-issued")}
+	_, err, called = callInterceptor(t, interceptor, ctxWithBearer("key-a"),
+		"/temporal.api.workflowservice.v1.WorkflowService/RespondNexusTaskFailed",
+		req2, &workflowservice.RespondNexusTaskFailedResponse{}, nil)
+	if called {
+		t.Fatalf("handler must not run for an unknown nexus token")
+	}
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied, got %v", err)
+	}
+}
+
+func TestInterceptor_NexusResponsesEvictToken(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		req    any
+		resp   any
+	}{
+		{
+			name:   "completed",
+			method: "/temporal.api.workflowservice.v1.WorkflowService/RespondNexusTaskCompleted",
+			req:    &workflowservice.RespondNexusTaskCompletedRequest{Namespace: "ns", TaskToken: []byte("nexus-tok-a")},
+			resp:   &workflowservice.RespondNexusTaskCompletedResponse{},
+		},
+		{
+			name:   "failed",
+			method: "/temporal.api.workflowservice.v1.WorkflowService/RespondNexusTaskFailed",
+			req:    &workflowservice.RespondNexusTaskFailedRequest{Namespace: "ns", TaskToken: []byte("nexus-tok-a")},
+			resp:   &workflowservice.RespondNexusTaskFailedResponse{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			authr := &fakeAuthenticator{identities: map[string]auth.Identity{
+				"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+			}}
+			cache := tokencache.New(time.Hour, 1000)
+			defer cache.Close()
+			interceptor := NewInterceptor(authr, cache)
+
+			cache.Put([]byte("nexus-tok-a"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
+
+			_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
+				tt.method, tt.req, tt.resp, nil)
+			if !called || err != nil {
+				t.Fatalf("expected successful call, called=%v err=%v", called, err)
+			}
+
+			if _, ok := cache.Get([]byte("nexus-tok-a")); ok {
+				t.Fatalf("expected nexus token to be evicted after terminal response")
+			}
+		})
 	}
 }
 

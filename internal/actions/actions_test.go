@@ -84,10 +84,14 @@ func TestFromRequest_NonActionRequests(t *testing.T) {
 	nonActions := []proto.Message{
 		&workflowservice.PollWorkflowTaskQueueRequest{},
 		&workflowservice.PollActivityTaskQueueRequest{},
+		&workflowservice.PollNexusTaskQueueRequest{},
 		&workflowservice.RespondActivityTaskCompletedRequest{},
 		&workflowservice.RespondWorkflowTaskFailedRequest{},
+		&workflowservice.RespondNexusTaskCompletedRequest{},
+		&workflowservice.RespondNexusTaskFailedRequest{},
 		&workflowservice.DescribeNamespaceRequest{},
 		&workflowservice.ShutdownWorkerRequest{},
+		&workflowservice.RecordWorkerHeartbeatRequest{},
 	}
 	for _, req := range nonActions {
 		if got := FromRequest(req); got != nil {
