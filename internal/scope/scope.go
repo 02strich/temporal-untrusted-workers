@@ -1,7 +1,8 @@
 // Package scope extracts the namespace/task-queue/task-token scoping
 // information from the WorkflowService RPCs the proxy allows, and validates
 // that a RespondWorkflowTaskCompleted request's emitted commands don't
-// target anywhere outside the caller's authorized namespace/task queue.
+// target anywhere outside the caller's authorized namespace and scoped task
+// queue.
 //
 // Extraction is done via explicit per-RPC type switches over the concrete
 // go.temporal.io/api generated structs rather than reflection: it is a
@@ -172,23 +173,33 @@ func CollectResponseTaskTokens(resp proto.Message) [][]byte {
 }
 
 // ValidateWorkerHeartbeatTaskQueues checks every heartbeat entry against the
-// caller's authorized task queue.
-func ValidateWorkerHeartbeatTaskQueues(heartbeats []*workerpb.WorkerHeartbeat, taskQueue string) error {
+// caller's authorized task queues.
+func ValidateWorkerHeartbeatTaskQueues(heartbeats []*workerpb.WorkerHeartbeat, taskQueues []string) error {
 	for i, hb := range heartbeats {
 		tq := hb.GetTaskQueue()
 		if tq == "" {
 			return fmt.Errorf("worker_heartbeat[%d] missing task queue", i)
 		}
-		if tq != taskQueue {
-			return fmt.Errorf("worker_heartbeat[%d] targets task queue %q, not authorized queue %q", i, tq, taskQueue)
+		if !containsTaskQueue(taskQueues, tq) {
+			return fmt.Errorf("worker_heartbeat[%d] targets task queue %q, not authorized", i, tq)
 		}
 	}
 	return nil
 }
 
-// ValidateCommands checks every command emitted by a RespondWorkflowTaskCompleted
-// call against the caller's authorized namespace/task queue. Only command
-// types that can direct work elsewhere are checked:
+func containsTaskQueue(taskQueues []string, taskQueue string) bool {
+	for _, allowed := range taskQueues {
+		if allowed == taskQueue {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateCommands checks every command emitted by a
+// RespondWorkflowTaskCompleted call against the caller's authorized namespace
+// and the task queue that issued the workflow task token. Only command types
+// that can direct work elsewhere are checked:
 //
 //   - ScheduleActivityTaskCommandAttributes: TaskQueue.Name must equal
 //     taskQueue. Activities are always scheduled in the workflow's own

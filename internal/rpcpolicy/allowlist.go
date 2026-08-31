@@ -4,7 +4,7 @@
 package rpcpolicy
 
 // Category describes how an RPC's request carries the information needed to
-// scope it to a single namespace/task queue.
+// scope it to a namespace, task queue, or task token.
 type Category int
 
 const (
@@ -21,7 +21,7 @@ const (
 	CategoryNamespaceOnly
 	// CategoryWorker requests carry an explicit namespace and the normal task
 	// queue name as a plain string (which may be empty). When the name is set
-	// it must match the caller's authorized queue; any sticky queue name they
+	// it must match one of the caller's authorized queues; any sticky queue name they
 	// also carry is a per-worker unguessable identifier and is not checked.
 	CategoryWorker
 	// CategoryWorkerHeartbeat requests carry an explicit namespace and a batch
@@ -42,9 +42,10 @@ type Policy struct {
 // here is rejected with PermissionDenied before a handler ever runs.
 //
 // RespondWorkflowTaskCompleted additionally has its emitted Commands
-// validated against the caller's namespace/task queue (see
-// internal/scope.ValidateCommands) - that check is RPC-specific rather than
-// a generic Category and so is not represented in this table.
+// validated against the caller's namespace and the task queue that issued the
+// workflow task token (see internal/scope.ValidateCommands) - that check is
+// RPC-specific rather than a generic Category and so is not represented in
+// this table.
 //
 // The *ById activity-completion RPCs (RespondActivityTaskCompletedById,
 // RespondActivityTaskFailedById, RespondActivityTaskCanceledById) and

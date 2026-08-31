@@ -5,15 +5,25 @@ package auth
 import "context"
 
 // Identity is the result of resolving an API key presented by a downstream
-// caller. A valid Identity pins the caller to exactly one namespace and task
-// queue; the proxy rejects any call that would touch anything else.
+// caller. A valid Identity pins the caller to exactly one namespace and one or
+// more task queues; the proxy rejects any call that would touch anything else.
 type Identity struct {
-	Valid     bool
-	Namespace string
-	TaskQueue string
+	Valid      bool
+	Namespace  string
+	TaskQueues []string
 	// Subject is an optional human-readable identifier for the credential,
 	// used only for logging/audit.
 	Subject string
+}
+
+// AllowsTaskQueue reports whether the identity is authorized for taskQueue.
+func (i Identity) AllowsTaskQueue(taskQueue string) bool {
+	for _, allowed := range i.TaskQueues {
+		if allowed == taskQueue {
+			return true
+		}
+	}
+	return false
 }
 
 // Authenticator resolves an API key extracted from incoming request

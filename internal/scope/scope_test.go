@@ -159,14 +159,14 @@ func TestValidateWorkerHeartbeatTaskQueues(t *testing.T) {
 	if err := ValidateWorkerHeartbeatTaskQueues(
 		[]*workerpb.WorkerHeartbeat{
 			{TaskQueue: "queue-a"},
-			{TaskQueue: "queue-a"},
+			{TaskQueue: "queue-b"},
 		},
-		"queue-a",
+		[]string{"queue-a", "queue-b"},
 	); err != nil {
 		t.Fatalf("expected matching heartbeats to pass, got %v", err)
 	}
 
-	if err := ValidateWorkerHeartbeatTaskQueues(nil, "queue-a"); err != nil {
+	if err := ValidateWorkerHeartbeatTaskQueues(nil, []string{"queue-a"}); err != nil {
 		t.Fatalf("expected empty heartbeat batch to pass, got %v", err)
 	}
 
@@ -174,7 +174,7 @@ func TestValidateWorkerHeartbeatTaskQueues(t *testing.T) {
 		[]*workerpb.WorkerHeartbeat{
 			{TaskQueue: "queue-b"},
 		},
-		"queue-a",
+		[]string{"queue-a"},
 	); err == nil {
 		t.Fatalf("expected cross-queue heartbeat to fail")
 	}
@@ -183,7 +183,7 @@ func TestValidateWorkerHeartbeatTaskQueues(t *testing.T) {
 		[]*workerpb.WorkerHeartbeat{
 			{},
 		},
-		"queue-a",
+		[]string{"queue-a"},
 	); err == nil {
 		t.Fatalf("expected heartbeat with empty task queue to fail")
 	}
@@ -192,7 +192,7 @@ func TestValidateWorkerHeartbeatTaskQueues(t *testing.T) {
 		[]*workerpb.WorkerHeartbeat{
 			nil,
 		},
-		"queue-a",
+		[]string{"queue-a"},
 	); err == nil {
 		t.Fatalf("expected nil heartbeat entry to fail")
 	}

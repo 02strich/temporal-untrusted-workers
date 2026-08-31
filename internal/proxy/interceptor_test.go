@@ -108,7 +108,7 @@ func (f *fakeTokenStore) Close() error {
 
 func TestInterceptor_DeniesUnknownRPC(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -130,7 +130,7 @@ func TestInterceptor_DeniesUnknownRPC(t *testing.T) {
 
 func TestInterceptor_DeniesMissingCredentials(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -170,7 +170,7 @@ func TestInterceptor_DeniesInvalidAPIKey(t *testing.T) {
 
 func TestInterceptor_PollAllowsMatchingQueue(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -198,11 +198,36 @@ func TestInterceptor_PollAllowsMatchingQueue(t *testing.T) {
 	}
 }
 
+func TestInterceptor_PollAllowsMultipleAuthorizedQueues(t *testing.T) {
+	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a", "queue-b"}},
+	}}
+	cache := tokencache.New(time.Hour, 1000)
+	defer cache.Close()
+	interceptor := NewInterceptor(authr, cache)
+
+	for _, taskQueue := range []string{"queue-a", "queue-b"} {
+		token := []byte("tok-" + taskQueue)
+		req := &workflowservice.PollWorkflowTaskQueueRequest{Namespace: "ns", TaskQueue: &taskqueuepb.TaskQueue{Name: taskQueue}}
+		_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
+			"/temporal.api.workflowservice.v1.WorkflowService/PollWorkflowTaskQueue",
+			req, &workflowservice.PollWorkflowTaskQueueResponse{TaskToken: token}, nil)
+
+		if !called || err != nil {
+			t.Fatalf("expected authorized poll for %s, called=%v err=%v", taskQueue, called, err)
+		}
+		entry, ok := getCache(t, cache, token)
+		if !ok || entry.Namespace != "ns" || entry.TaskQueue != taskQueue {
+			t.Fatalf("expected token to be cached for %s, got %+v (found=%v)", taskQueue, entry, ok)
+		}
+	}
+}
+
 const pollNexusMethod = "/temporal.api.workflowservice.v1.WorkflowService/PollNexusTaskQueue"
 
 func TestInterceptor_PollNexusAllowsMatchingQueueAndCachesToken(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a", "queue-b"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -210,9 +235,10 @@ func TestInterceptor_PollNexusAllowsMatchingQueueAndCachesToken(t *testing.T) {
 
 	req := &workflowservice.PollNexusTaskQueueRequest{
 		Namespace: "ns",
-		TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-a"},
+		TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-b"},
 		WorkerHeartbeat: []*workerpb.WorkerHeartbeat{
 			{TaskQueue: "queue-a"},
+			{TaskQueue: "queue-b"},
 		},
 	}
 	resp, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
@@ -230,14 +256,14 @@ func TestInterceptor_PollNexusAllowsMatchingQueueAndCachesToken(t *testing.T) {
 	}
 
 	entry, ok := getCache(t, cache, []byte("nexus-tok-1"))
-	if !ok || entry.Namespace != "ns" || entry.TaskQueue != "queue-a" {
+	if !ok || entry.Namespace != "ns" || entry.TaskQueue != "queue-b" {
 		t.Fatalf("expected nexus token to be cached for the polling identity, got %+v (found=%v)", entry, ok)
 	}
 }
 
 func TestInterceptor_PollNexusAllowsEmptyWorkerHeartbeatBatch(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -261,7 +287,7 @@ func TestInterceptor_PollNexusAllowsEmptyWorkerHeartbeatBatch(t *testing.T) {
 
 func TestInterceptor_PollNexusDeniesWrongQueue(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -282,7 +308,7 @@ func TestInterceptor_PollNexusDeniesWrongQueue(t *testing.T) {
 
 func TestInterceptor_PollNexusDeniesWrongNamespace(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns-a", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns-a", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -303,7 +329,7 @@ func TestInterceptor_PollNexusDeniesWrongNamespace(t *testing.T) {
 
 func TestInterceptor_PollNexusDeniesWrongWorkerHeartbeatQueue(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -330,19 +356,37 @@ func TestInterceptor_PollNexusDeniesWrongWorkerHeartbeatQueue(t *testing.T) {
 
 const shutdownWorkerMethod = "/temporal.api.workflowservice.v1.WorkflowService/ShutdownWorker"
 
-func shutdownInterceptor(t *testing.T) grpc.UnaryServerInterceptor {
+func workerInterceptor(t *testing.T, taskQueues ...string) grpc.UnaryServerInterceptor {
 	t.Helper()
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: taskQueues},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	t.Cleanup(func() { _ = cache.Close() })
 	return NewInterceptor(authr, cache)
 }
 
+func shutdownInterceptor(t *testing.T) grpc.UnaryServerInterceptor {
+	t.Helper()
+	return workerInterceptor(t, "queue-a")
+}
+
 func TestInterceptor_ShutdownWorkerAllowsMatchingQueue(t *testing.T) {
 	req := &workflowservice.ShutdownWorkerRequest{Namespace: "ns", TaskQueue: "queue-a", StickyTaskQueue: "host:random-uuid"}
 	_, err, called := callInterceptor(t, shutdownInterceptor(t), ctxWithBearer("key-a"),
+		shutdownWorkerMethod, req, &workflowservice.ShutdownWorkerResponse{}, nil)
+
+	if !called {
+		t.Fatalf("handler should have run for an authorized ShutdownWorker")
+	}
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestInterceptor_ShutdownWorkerAllowsAnyAuthorizedQueue(t *testing.T) {
+	req := &workflowservice.ShutdownWorkerRequest{Namespace: "ns", TaskQueue: "queue-b"}
+	_, err, called := callInterceptor(t, workerInterceptor(t, "queue-a", "queue-b"), ctxWithBearer("key-a"),
 		shutdownWorkerMethod, req, &workflowservice.ShutdownWorkerResponse{}, nil)
 
 	if !called {
@@ -420,10 +464,10 @@ func TestInterceptor_RecordWorkerHeartbeatAllowsMultipleMatchingHeartbeats(t *te
 		Namespace: "ns",
 		WorkerHeartbeat: []*workerpb.WorkerHeartbeat{
 			{TaskQueue: "queue-a", WorkerIdentity: "worker-1"},
-			{TaskQueue: "queue-a", WorkerIdentity: "worker-2"},
+			{TaskQueue: "queue-b", WorkerIdentity: "worker-2"},
 		},
 	}
-	_, err, called := callInterceptor(t, shutdownInterceptor(t), ctxWithBearer("key-a"),
+	_, err, called := callInterceptor(t, workerInterceptor(t, "queue-a", "queue-b"), ctxWithBearer("key-a"),
 		recordWorkerHeartbeatMethod, req, &workflowservice.RecordWorkerHeartbeatResponse{}, nil)
 
 	if !called {
@@ -504,7 +548,7 @@ func TestInterceptor_RecordWorkerHeartbeatDeniesEmptyQueue(t *testing.T) {
 
 func TestInterceptor_PollDeniesWrongQueue(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -525,7 +569,7 @@ func TestInterceptor_PollDeniesWrongQueue(t *testing.T) {
 
 func TestInterceptor_PollDeniesWrongNamespace(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns-a", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns-a", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -546,8 +590,8 @@ func TestInterceptor_PollDeniesWrongNamespace(t *testing.T) {
 
 func TestInterceptor_TokenScoping(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
-		"key-b": {Valid: true, Namespace: "ns", TaskQueue: "queue-b"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
+		"key-b": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-b"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -594,9 +638,50 @@ func TestInterceptor_TokenScoping(t *testing.T) {
 	}
 }
 
+func TestInterceptor_TokenScopingAllowsAnyAuthorizedQueue(t *testing.T) {
+	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
+		"key-ab": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a", "queue-b"}},
+	}}
+	cache := tokencache.New(time.Hour, 1000)
+	defer cache.Close()
+	interceptor := NewInterceptor(authr, cache)
+
+	for _, tt := range []struct {
+		token     string
+		taskQueue string
+		wantAllow bool
+	}{
+		{token: "tok-a", taskQueue: "queue-a", wantAllow: true},
+		{token: "tok-b", taskQueue: "queue-b", wantAllow: true},
+		{token: "tok-c", taskQueue: "queue-c", wantAllow: false},
+	} {
+		t.Run(tt.token, func(t *testing.T) {
+			putCache(t, cache, []byte(tt.token), tokencache.Entry{Namespace: "ns", TaskQueue: tt.taskQueue})
+
+			req := &workflowservice.RespondActivityTaskCompletedRequest{Namespace: "ns", TaskToken: []byte(tt.token)}
+			_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-ab"),
+				"/temporal.api.workflowservice.v1.WorkflowService/RespondActivityTaskCompleted",
+				req, &workflowservice.RespondActivityTaskCompletedResponse{}, nil)
+
+			if tt.wantAllow {
+				if !called || err != nil {
+					t.Fatalf("expected token for %s to be allowed, called=%v err=%v", tt.taskQueue, called, err)
+				}
+				return
+			}
+			if called {
+				t.Fatalf("handler must not run for token bound to unauthorized queue")
+			}
+			if status.Code(err) != codes.PermissionDenied {
+				t.Fatalf("expected PermissionDenied, got %v", err)
+			}
+		})
+	}
+}
+
 func TestInterceptor_TokenCacheGetErrorFailsClosed(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := newFakeTokenStore()
 	cache.getErr = errors.New("cache read failed")
@@ -617,7 +702,7 @@ func TestInterceptor_TokenCacheGetErrorFailsClosed(t *testing.T) {
 
 func TestInterceptor_TokenCachePutErrorFailsSuccessfulPoll(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := newFakeTokenStore()
 	cache.putErr = errors.New("cache write failed")
@@ -638,7 +723,7 @@ func TestInterceptor_TokenCachePutErrorFailsSuccessfulPoll(t *testing.T) {
 
 func TestInterceptor_TokenCacheDeleteErrorDoesNotFailTerminalRPC(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := newFakeTokenStore()
 	cache.entries["tok-a"] = tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"}
@@ -660,8 +745,8 @@ func TestInterceptor_TokenCacheDeleteErrorDoesNotFailTerminalRPC(t *testing.T) {
 
 func TestInterceptor_NexusResponsesUseTokenScoping(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
-		"key-b": {Valid: true, Namespace: "ns", TaskQueue: "queue-b"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
+		"key-b": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-b"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -716,7 +801,7 @@ func TestInterceptor_NexusResponsesEvictToken(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-				"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+				"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
 			}}
 			cache := tokencache.New(time.Hour, 1000)
 			defer cache.Close()
@@ -739,7 +824,7 @@ func TestInterceptor_NexusResponsesEvictToken(t *testing.T) {
 
 func TestInterceptor_TerminalRPCEvictsToken(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -762,7 +847,7 @@ func TestInterceptor_TerminalRPCEvictsToken(t *testing.T) {
 
 func TestInterceptor_HeartbeatDoesNotEvictToken(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -785,7 +870,7 @@ func TestInterceptor_HeartbeatDoesNotEvictToken(t *testing.T) {
 
 func TestInterceptor_HandlerErrorDoesNotMutateCache(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -811,13 +896,13 @@ func TestInterceptor_HandlerErrorDoesNotMutateCache(t *testing.T) {
 
 func TestInterceptor_EagerDispatchTokensAreRegistered(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a", "queue-b"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
 	interceptor := NewInterceptor(authr, cache)
 
-	putCache(t, cache, []byte("wt-tok"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
+	putCache(t, cache, []byte("wt-tok"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-b"})
 
 	resp := &workflowservice.RespondWorkflowTaskCompletedResponse{
 		WorkflowTask: &workflowservice.PollWorkflowTaskQueueResponse{TaskToken: []byte("new-wt-tok")},
@@ -836,7 +921,7 @@ func TestInterceptor_EagerDispatchTokensAreRegistered(t *testing.T) {
 
 	for _, tok := range [][]byte{[]byte("new-wt-tok"), []byte("eager-activity-tok")} {
 		entry, ok := getCache(t, cache, tok)
-		if !ok || entry.Namespace != "ns" || entry.TaskQueue != "queue-a" {
+		if !ok || entry.Namespace != "ns" || entry.TaskQueue != "queue-b" {
 			t.Fatalf("expected eager-dispatch token %s to be registered, got %+v (found=%v)", tok, entry, ok)
 		}
 	}
@@ -844,7 +929,7 @@ func TestInterceptor_EagerDispatchTokensAreRegistered(t *testing.T) {
 
 func TestInterceptor_DeniesCommandTargetingDifferentQueue(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a", "queue-b"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -888,7 +973,7 @@ func TestInterceptor_DeniesCommandTargetingDifferentQueue(t *testing.T) {
 
 func TestInterceptor_AllowsCommandTargetingOwnQueue(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -921,7 +1006,7 @@ func TestInterceptor_AllowsCommandTargetingOwnQueue(t *testing.T) {
 
 func TestInterceptor_GetSystemInfoNeedsOnlyValidIdentity(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -969,7 +1054,7 @@ func logLinesWithMsg(t *testing.T, buf *bytes.Buffer, msg string) []map[string]a
 
 func TestInterceptor_LogsCloudActionPerBillableCommand(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a", Subject: "worker-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}, Subject: "worker-a"},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -1018,7 +1103,7 @@ func TestInterceptor_LogsCloudActionPerBillableCommand(t *testing.T) {
 
 func TestInterceptor_PollEmitsNoCloudAction(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -1041,7 +1126,7 @@ func TestInterceptor_PollEmitsNoCloudAction(t *testing.T) {
 
 func TestInterceptor_PollAllowsOwnStickyQueue(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -1064,9 +1149,38 @@ func TestInterceptor_PollAllowsOwnStickyQueue(t *testing.T) {
 	}
 }
 
+func TestInterceptor_PollAllowsStickyQueueForAnyAuthorizedNormalQueue(t *testing.T) {
+	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a", "queue-b"}},
+	}}
+	cache := tokencache.New(time.Hour, 1000)
+	defer cache.Close()
+	interceptor := NewInterceptor(authr, cache)
+
+	req := &workflowservice.PollWorkflowTaskQueueRequest{
+		Namespace: "ns",
+		TaskQueue: &taskqueuepb.TaskQueue{
+			Name:       "some-host:some-random-worker-uuid",
+			Kind:       enums.TASK_QUEUE_KIND_STICKY,
+			NormalName: "queue-b",
+		},
+	}
+	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
+		"/temporal.api.workflowservice.v1.WorkflowService/PollWorkflowTaskQueue",
+		req, &workflowservice.PollWorkflowTaskQueueResponse{TaskToken: []byte("sticky-tok")}, nil)
+
+	if !called || err != nil {
+		t.Fatalf("expected sticky poll for authorized normal queue to be allowed, called=%v err=%v", called, err)
+	}
+	entry, ok := getCache(t, cache, []byte("sticky-tok"))
+	if !ok || entry.Namespace != "ns" || entry.TaskQueue != "queue-b" {
+		t.Fatalf("expected sticky token to be cached under normal queue, got %+v (found=%v)", entry, ok)
+	}
+}
+
 func TestInterceptor_PollDeniesStickyQueueForDifferentNormalQueue(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -1096,7 +1210,7 @@ func TestInterceptor_PollDeniesStickyQueueForDifferentNormalQueue(t *testing.T) 
 
 func TestInterceptor_DescribeNamespaceScopedToOwnNamespace(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns-a", TaskQueue: "queue-a"},
+		"key-a": {Valid: true, Namespace: "ns-a", TaskQueues: []string{"queue-a"}},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
@@ -1128,7 +1242,7 @@ func TestInterceptor_DescribeNamespaceScopedToOwnNamespace(t *testing.T) {
 // (internal/upstream) should ever set outbound auth headers.
 func TestInterceptor_DoesNotLeakIdentityIntoOutgoingMetadata(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
-		"key-a": {Valid: true, Namespace: "ns", TaskQueue: "queue-a", Subject: "worker-fleet-a"},
+		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a"}, Subject: "worker-fleet-a"},
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()

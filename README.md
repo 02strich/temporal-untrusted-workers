@@ -7,7 +7,7 @@ send signals, read history across a namespace, and so on. That is far too much a
 a worker fleet you do not fully trust (a customer's workers, workers in a less-trusted network, a
 multi-tenant pool). This proxy sits between such workers and the real Temporal server and forwards
 **only** the RPCs a worker needs to process tasks, pinning each authenticated worker identity to a
-single `namespace` + `task queue`.
+single `namespace` and one or more `task queues`.
 
 ```
 untrusted workers ──gRPC──▶  temporal-proxy  ──gRPC──▶  Temporal server / Temporal Cloud
@@ -39,23 +39,23 @@ before any request is forwarded. For each incoming call it:
 
 2. **Authenticates** the caller from the `authorization: Bearer <credential>` metadata (the same
    convention the Temporal SDK's API-key credential uses) and resolves it to an `Identity`
-   (`namespace`, `task_queue`, `subject`). See [Authentication modes](#authentication-modes).
+   (`namespace`, `task_queues`, `subject`). See [Authentication modes](#authentication-modes).
 
 3. **Scopes** the request to that identity (`internal/scope`):
-   - Poll RPCs must target the identity's namespace + task queue (sticky queues are authorized by
+   - Poll RPCs must target the identity's namespace and one of its task queues (sticky queues are authorized by
      their self-declared normal-queue name).
    - Token RPCs (`Respond*`, `RecordActivityTaskHeartbeat`) must present a task token the proxy
-     previously handed out for this identity — tracked in an in-memory **token cache**
+     previously handed out for this namespace and an authorized task queue — tracked in an in-memory **token cache**
      (`internal/tokencache`).
    - `PollNexusTaskQueue` also validates embedded worker heartbeat entries against the identity's
-     task queue before forwarding.
+     task queues before forwarding.
    - `DescribeNamespace` responses have the namespace `worker_commands` capability masked off before
      returning to the worker.
    - `RecordWorkerHeartbeat` must target the identity's namespace, and every reported heartbeat entry
-     must target the identity's task queue.
+     must target one of the identity's task queues.
    - `RespondWorkflowTaskCompleted` additionally has every emitted **command** validated so a
-     workflow cannot schedule activities / child workflows / continue-as-new onto another queue or
-     namespace.
+     workflow cannot schedule activities / child workflows / continue-as-new outside the task queue
+     that issued the workflow task token or outside the identity's namespace.
 
 4. **Logs billable actions.** On success, the proxy emits a `cloud action consumed` log line per
    billable [Temporal Cloud action](https://docs.temporal.io/cloud/actions) it can observe in worker
@@ -78,15 +78,17 @@ One file holds both credential tables; a deployment uses only the section that m
 ```json
 {
   "keys": {
-    "wk_live_abc123...": { "namespace": "default", "task_queue": "my-queue", "subject": "fleet-a" }
+    "wk_live_abc123...": { "namespace": "default", "task_queues": ["my-queue", "my-other-queue"], "subject": "fleet-a" }
   },
   "emails": {
-    "worker@my-project.iam.gserviceaccount.com": { "namespace": "default", "task_queue": "my-queue", "subject": "fleet-a" }
+    "worker@my-project.iam.gserviceaccount.com": { "namespace": "default", "task_queues": ["my-queue"], "subject": "fleet-a" }
   }
 }
 ```
 
-- `namespace` and `task_queue` are required per entry; `subject` is an optional label used only in logs.
+- `namespace` and `task_queues` are required per entry; `task_queues` must be a non-empty array of
+  non-empty names. `subject` is an optional label used only in logs.
+- Each identity is still limited to one namespace, even when it is authorized for multiple task queues.
 - API keys are stored hashed (sha256) in memory; emails are stored as-is.
 - A default file is baked into the proxy image at build time (`cmd/temporal-proxy/kodata/static-auth.json`,
   exposed at runtime via `KO_DATA_PATH`), so the container starts out of the box. Mount your own file

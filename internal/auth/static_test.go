@@ -20,7 +20,7 @@ func writeStaticAuthFile(t *testing.T, contents string) string {
 func TestStaticAuthenticator_ValidKey(t *testing.T) {
 	path := writeStaticAuthFile(t, `{
 		"keys": {
-			"testkey123": {"namespace": "default", "task_queue": "proxy-test-queue", "subject": "worker-fleet-a"}
+			"testkey123": {"namespace": "default", "task_queues": ["proxy-test-queue"], "subject": "worker-fleet-a"}
 		}
 	}`)
 
@@ -36,15 +36,36 @@ func TestStaticAuthenticator_ValidKey(t *testing.T) {
 	if !identity.Valid {
 		t.Fatalf("expected valid identity, got %+v", identity)
 	}
-	if identity.Namespace != "default" || identity.TaskQueue != "proxy-test-queue" || identity.Subject != "worker-fleet-a" {
+	if identity.Namespace != "default" || !identity.AllowsTaskQueue("proxy-test-queue") || identity.Subject != "worker-fleet-a" {
 		t.Fatalf("unexpected identity: %+v", identity)
+	}
+}
+
+func TestStaticAuthenticator_MultipleTaskQueues(t *testing.T) {
+	path := writeStaticAuthFile(t, `{
+		"keys": {
+			"testkey123": {"namespace": "default", "task_queues": ["queue-a", "queue-b"]}
+		}
+	}`)
+
+	a, err := NewStaticAuthenticatorFromFile(path)
+	if err != nil {
+		t.Fatalf("NewStaticAuthenticatorFromFile: %v", err)
+	}
+
+	identity, err := a.Authenticate(context.Background(), "testkey123")
+	if err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+	if !identity.AllowsTaskQueue("queue-a") || !identity.AllowsTaskQueue("queue-b") || identity.AllowsTaskQueue("queue-c") {
+		t.Fatalf("unexpected task queue authorization: %+v", identity)
 	}
 }
 
 func TestStaticAuthenticator_UnknownKey(t *testing.T) {
 	path := writeStaticAuthFile(t, `{
 		"keys": {
-			"testkey123": {"namespace": "default", "task_queue": "proxy-test-queue"}
+			"testkey123": {"namespace": "default", "task_queues": ["proxy-test-queue"]}
 		}
 	}`)
 
@@ -65,8 +86,8 @@ func TestStaticAuthenticator_UnknownKey(t *testing.T) {
 func TestStaticAuthenticator_TwoDistinctKeys(t *testing.T) {
 	path := writeStaticAuthFile(t, `{
 		"keys": {
-			"key-a": {"namespace": "default", "task_queue": "queue-a"},
-			"key-b": {"namespace": "default", "task_queue": "queue-b"}
+			"key-a": {"namespace": "default", "task_queues": ["queue-a"]},
+			"key-b": {"namespace": "default", "task_queues": ["queue-b"]}
 		}
 	}`)
 
@@ -78,7 +99,7 @@ func TestStaticAuthenticator_TwoDistinctKeys(t *testing.T) {
 	idA, _ := a.Authenticate(context.Background(), "key-a")
 	idB, _ := a.Authenticate(context.Background(), "key-b")
 
-	if idA.TaskQueue != "queue-a" || idB.TaskQueue != "queue-b" {
+	if !idA.AllowsTaskQueue("queue-a") || !idB.AllowsTaskQueue("queue-b") {
 		t.Fatalf("keys resolved to wrong queues: idA=%+v idB=%+v", idA, idB)
 	}
 }
@@ -88,8 +109,8 @@ func TestStaticAuthenticator_TwoDistinctKeys(t *testing.T) {
 // "emails".
 func TestStaticAuthenticator_IgnoresEmailsSection(t *testing.T) {
 	path := writeStaticAuthFile(t, `{
-		"keys":   {"key-a": {"namespace": "default", "task_queue": "key-queue"}},
-		"emails": {"sa@project.iam.gserviceaccount.com": {"namespace": "default", "task_queue": "email-queue"}}
+		"keys":   {"key-a": {"namespace": "default", "task_queues": ["key-queue"]}},
+		"emails": {"sa@project.iam.gserviceaccount.com": {"namespace": "default", "task_queues": ["email-queue"]}}
 	}`)
 
 	a, err := NewStaticAuthenticatorFromFile(path)
@@ -98,7 +119,7 @@ func TestStaticAuthenticator_IgnoresEmailsSection(t *testing.T) {
 	}
 
 	id, _ := a.Authenticate(context.Background(), "key-a")
-	if !id.Valid || id.TaskQueue != "key-queue" {
+	if !id.Valid || !id.AllowsTaskQueue("key-queue") {
 		t.Fatalf("expected key-queue from keys section, got %+v", id)
 	}
 
@@ -116,6 +137,42 @@ func TestStaticAuthenticator_MissingField(t *testing.T) {
 	}`)
 
 	if _, err := NewStaticAuthenticatorFromFile(path); err == nil {
-		t.Fatalf("expected error for entry missing task_queue")
+		t.Fatalf("expected error for entry missing task_queues")
+	}
+}
+
+func TestStaticAuthenticator_RejectsOldTaskQueueField(t *testing.T) {
+	path := writeStaticAuthFile(t, `{
+		"keys": {
+			"key-a": {"namespace": "default", "task_queue": "queue-a"}
+		}
+	}`)
+
+	if _, err := NewStaticAuthenticatorFromFile(path); err == nil {
+		t.Fatalf("expected error for entry using old task_queue field")
+	}
+}
+
+func TestStaticAuthenticator_RejectsEmptyTaskQueues(t *testing.T) {
+	path := writeStaticAuthFile(t, `{
+		"keys": {
+			"key-a": {"namespace": "default", "task_queues": []}
+		}
+	}`)
+
+	if _, err := NewStaticAuthenticatorFromFile(path); err == nil {
+		t.Fatalf("expected error for empty task_queues")
+	}
+}
+
+func TestStaticAuthenticator_RejectsEmptyTaskQueueName(t *testing.T) {
+	path := writeStaticAuthFile(t, `{
+		"keys": {
+			"key-a": {"namespace": "default", "task_queues": ["queue-a", ""]}
+		}
+	}`)
+
+	if _, err := NewStaticAuthenticatorFromFile(path); err == nil {
+		t.Fatalf("expected error for empty task queue name")
 	}
 }

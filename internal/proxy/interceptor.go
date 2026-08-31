@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	enums "go.temporal.io/api/enums/v1"
+	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -66,7 +67,8 @@ func NewInterceptor(authenticator auth.Authenticator, cache tokencache.Store) gr
 			return nil, status.Error(codes.Internal, "proxy: request does not implement proto.Message")
 		}
 
-		if err := authorizeRequest(ctx, protoReq, rpcName, policy, identity, cache); err != nil {
+		scopedTaskQueue, err := authorizeRequest(ctx, protoReq, rpcName, policy, identity, cache)
+		if err != nil {
 			slog.Warn("access denied", "rpc", rpcName, "subject", identity.Subject, "reason", err.Error())
 			return nil, grpcErrorForAuthorizationError(err)
 		}
@@ -89,7 +91,11 @@ func NewInterceptor(authenticator auth.Authenticator, cache tokencache.Store) gr
 		}
 		if protoResp, ok := resp.(proto.Message); ok {
 			for _, token := range scope.CollectResponseTaskTokens(protoResp) {
-				if err := cache.Put(ctx, token, tokencache.Entry{Namespace: identity.Namespace, TaskQueue: identity.TaskQueue}); err != nil {
+				if scopedTaskQueue == "" {
+					slog.Error("missing task queue scope for response token", "rpc", rpcName, "subject", identity.Subject)
+					return nil, status.Error(codes.Internal, "proxy: missing task queue scope")
+				}
+				if err := cache.Put(ctx, token, tokencache.Entry{Namespace: identity.Namespace, TaskQueue: scopedTaskQueue}); err != nil {
 					slog.Error("token cache put failed after successful upstream RPC", "rpc", rpcName, "subject", identity.Subject, "error", err)
 					return nil, status.Error(codes.Unavailable, "token cache unavailable")
 				}
@@ -105,7 +111,7 @@ func NewInterceptor(authenticator auth.Authenticator, cache tokencache.Store) gr
 				"actions", a.Count,
 				"rpc", rpcName,
 				"namespace", identity.Namespace,
-				"task_queue", identity.TaskQueue,
+				"task_queue", scopedTaskQueue,
 				"subject", identity.Subject)
 		}
 
@@ -168,58 +174,70 @@ func extractAPIKey(ctx context.Context) (string, error) {
 }
 
 // authorizeRequest checks req against identity's authorized namespace/task
-// queue, per policy.Category, and - for RespondWorkflowTaskCompleted -
-// additionally validates that none of the request's commands target
-// anywhere else.
-func authorizeRequest(ctx context.Context, req proto.Message, rpcName string, policy rpcpolicy.Policy, identity auth.Identity, cache tokencache.Store) error {
+// queues, per policy.Category, and - for RespondWorkflowTaskCompleted -
+// additionally validates that none of the request's commands target anywhere
+// outside the queue that issued the workflow task token. It returns the
+// concrete task queue this request is scoped to, when one is established.
+func authorizeRequest(ctx context.Context, req proto.Message, rpcName string, policy rpcpolicy.Policy, identity auth.Identity, cache tokencache.Store) (string, error) {
 	switch policy.Category {
 	case rpcpolicy.CategoryPoll:
 		ns, _ := scope.RequestNamespace(req)
 		if ns != identity.Namespace {
-			return fmt.Errorf("namespace %q not authorized for this identity", ns)
+			return "", fmt.Errorf("namespace %q not authorized for this identity", ns)
 		}
 
 		tq, ok := scope.RequestTaskQueue(req)
 		if !ok || tq.GetName() == "" {
-			return errors.New("missing task queue")
+			return "", errors.New("missing task queue")
 		}
 
-		if tq.GetKind() == enums.TASK_QUEUE_KIND_STICKY {
-			// The sticky queue Name is a random per-worker identifier, not
-			// the configured queue - authorize by the real queue it
-			// declares itself bound to instead (see scope.RequestTaskQueue).
-			if tq.GetNormalName() != identity.TaskQueue {
-				return fmt.Errorf("sticky task queue for normal queue %q not authorized for this identity", tq.GetNormalName())
+		taskQueue := pollTaskQueueScope(tq)
+		if taskQueue == "" {
+			return "", errors.New("missing task queue")
+		}
+		if !identity.AllowsTaskQueue(taskQueue) {
+			if tq.GetKind() == enums.TASK_QUEUE_KIND_STICKY {
+				return "", fmt.Errorf("sticky task queue for normal queue %q not authorized for this identity", taskQueue)
 			}
-		} else if tq.GetName() != identity.TaskQueue {
-			return fmt.Errorf("task queue %q not authorized for this identity", tq.GetName())
+			return "", fmt.Errorf("task queue %q not authorized for this identity", taskQueue)
 		}
 		if r, ok := req.(*workflowservice.PollNexusTaskQueueRequest); ok {
-			if err := scope.ValidateWorkerHeartbeatTaskQueues(r.GetWorkerHeartbeat(), identity.TaskQueue); err != nil {
-				return err
+			if err := scope.ValidateWorkerHeartbeatTaskQueues(r.GetWorkerHeartbeat(), identity.TaskQueues); err != nil {
+				return "", err
 			}
 		}
+		return taskQueue, nil
 
 	case rpcpolicy.CategoryToken:
 		if ns, ok := scope.RequestNamespace(req); ok && ns != identity.Namespace {
-			return fmt.Errorf("namespace %q not authorized for this identity", ns)
+			return "", fmt.Errorf("namespace %q not authorized for this identity", ns)
 		}
 
 		token, ok := scope.RequestTaskToken(req)
 		if !ok || len(token) == 0 {
-			return errors.New("missing task token")
+			return "", errors.New("missing task token")
 		}
 
 		entry, found, err := cache.Get(ctx, token)
 		if err != nil {
-			return tokenCacheUnavailableError{err: err}
+			return "", tokenCacheUnavailableError{err: err}
 		}
 		if !found {
-			return errors.New("unknown or expired task token")
+			return "", errors.New("unknown or expired task token")
 		}
-		if entry.Namespace != identity.Namespace || entry.TaskQueue != identity.TaskQueue {
-			return errors.New("task token not authorized for this identity")
+		if entry.Namespace != identity.Namespace || !identity.AllowsTaskQueue(entry.TaskQueue) {
+			return "", errors.New("task token not authorized for this identity")
 		}
+
+		if rpcName == "RespondWorkflowTaskCompleted" {
+			if r, ok := req.(*workflowservice.RespondWorkflowTaskCompletedRequest); ok {
+				if err := scope.ValidateCommands(r.GetCommands(), identity.Namespace, entry.TaskQueue); err != nil {
+					return "", err
+				}
+			}
+		}
+
+		return entry.TaskQueue, nil
 
 	case rpcpolicy.CategoryUnscoped:
 		// A valid, recognized identity is sufficient.
@@ -227,43 +245,49 @@ func authorizeRequest(ctx context.Context, req proto.Message, rpcName string, po
 	case rpcpolicy.CategoryNamespaceOnly:
 		ns, _ := scope.RequestNamespace(req)
 		if ns != identity.Namespace {
-			return fmt.Errorf("namespace %q not authorized for this identity", ns)
+			return "", fmt.Errorf("namespace %q not authorized for this identity", ns)
 		}
 
 	case rpcpolicy.CategoryWorker:
 		ns, _ := scope.RequestNamespace(req)
 		if ns != identity.Namespace {
-			return fmt.Errorf("namespace %q not authorized for this identity", ns)
+			return "", fmt.Errorf("namespace %q not authorized for this identity", ns)
 		}
 		// The normal task-queue name is optional here; when present it must
-		// match the caller's queue so a worker can't cancel another queue's
-		// outstanding polls within the namespace. The unguessable sticky queue
-		// name (if any) needs no check, mirroring the sticky Poll case.
-		if tq, ok := scope.RequestTaskQueueName(req); ok && tq != "" && tq != identity.TaskQueue {
-			return fmt.Errorf("task queue %q not authorized for this identity", tq)
+		// match one of the caller's queues so a worker can't cancel another
+		// queue's outstanding polls within the namespace. The unguessable
+		// sticky queue name (if any) needs no check, mirroring the sticky Poll
+		// case.
+		if tq, ok := scope.RequestTaskQueueName(req); ok {
+			if tq != "" && !identity.AllowsTaskQueue(tq) {
+				return "", fmt.Errorf("task queue %q not authorized for this identity", tq)
+			}
+			return tq, nil
 		}
 
 	case rpcpolicy.CategoryWorkerHeartbeat:
 		ns, _ := scope.RequestNamespace(req)
 		if ns != identity.Namespace {
-			return fmt.Errorf("namespace %q not authorized for this identity", ns)
+			return "", fmt.Errorf("namespace %q not authorized for this identity", ns)
 		}
 		r, ok := req.(*workflowservice.RecordWorkerHeartbeatRequest)
 		if !ok {
-			return errors.New("invalid worker heartbeat request")
+			return "", errors.New("invalid worker heartbeat request")
 		}
-		if err := scope.ValidateWorkerHeartbeatTaskQueues(r.GetWorkerHeartbeat(), identity.TaskQueue); err != nil {
-			return err
-		}
-	}
-
-	if rpcName == "RespondWorkflowTaskCompleted" {
-		if r, ok := req.(*workflowservice.RespondWorkflowTaskCompletedRequest); ok {
-			if err := scope.ValidateCommands(r.GetCommands(), identity.Namespace, identity.TaskQueue); err != nil {
-				return err
-			}
+		if err := scope.ValidateWorkerHeartbeatTaskQueues(r.GetWorkerHeartbeat(), identity.TaskQueues); err != nil {
+			return "", err
 		}
 	}
 
-	return nil
+	return "", nil
+}
+
+func pollTaskQueueScope(tq *taskqueuepb.TaskQueue) string {
+	if tq.GetKind() == enums.TASK_QUEUE_KIND_STICKY {
+		// The sticky queue Name is a random per-worker identifier, not
+		// the configured queue - authorize by the real queue it
+		// declares itself bound to instead (see scope.RequestTaskQueue).
+		return tq.GetNormalName()
+	}
+	return tq.GetName()
 }

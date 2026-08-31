@@ -11,9 +11,9 @@ import (
 
 // staticKeyEntry is the JSON shape of one entry in a static auth file.
 type staticKeyEntry struct {
-	Namespace string `json:"namespace"`
-	TaskQueue string `json:"task_queue"`
-	Subject   string `json:"subject"`
+	Namespace  string   `json:"namespace"`
+	TaskQueues []string `json:"task_queues"`
+	Subject    string   `json:"subject"`
 }
 
 // authFileConfig is the JSON shape of the unified auth file. "keys" maps raw
@@ -23,8 +23,8 @@ type staticKeyEntry struct {
 // its configured auth mode.
 //
 //	{
-//	  "keys":   {"wk_live_abc123...":        {"namespace": "default", "task_queue": "my-task-queue", "subject": "worker-fleet-a"}},
-//	  "emails": {"sa@project.iam.gserviceaccount.com": {"namespace": "default", "task_queue": "my-task-queue", "subject": "worker-fleet-a"}}
+//	  "keys":   {"wk_live_abc123...":        {"namespace": "default", "task_queues": ["my-task-queue"], "subject": "worker-fleet-a"}},
+//	  "emails": {"sa@project.iam.gserviceaccount.com": {"namespace": "default", "task_queues": ["my-task-queue"], "subject": "worker-fleet-a"}}
 //	}
 type authFileConfig struct {
 	Keys   map[string]staticKeyEntry `json:"keys"`
@@ -52,21 +52,39 @@ func loadAuthFile(path string) (authFileConfig, error) {
 func buildIdentities(entries map[string]staticKeyEntry, hash bool) (map[string]Identity, error) {
 	identities := make(map[string]Identity, len(entries))
 	for lookupKey, entry := range entries {
-		if entry.Namespace == "" || entry.TaskQueue == "" {
-			return nil, fmt.Errorf("auth: auth file: entry %q is missing namespace or task_queue", lookupKey)
+		if entry.Namespace == "" {
+			return nil, fmt.Errorf("auth: auth file: entry %q is missing namespace", lookupKey)
+		}
+		taskQueues, err := validateTaskQueues(lookupKey, entry.TaskQueues)
+		if err != nil {
+			return nil, err
 		}
 		mapKey := lookupKey
 		if hash {
 			mapKey = hashKey(lookupKey)
 		}
 		identities[mapKey] = Identity{
-			Valid:     true,
-			Namespace: entry.Namespace,
-			TaskQueue: entry.TaskQueue,
-			Subject:   entry.Subject,
+			Valid:      true,
+			Namespace:  entry.Namespace,
+			TaskQueues: taskQueues,
+			Subject:    entry.Subject,
 		}
 	}
 	return identities, nil
+}
+
+func validateTaskQueues(lookupKey string, taskQueues []string) ([]string, error) {
+	if len(taskQueues) == 0 {
+		return nil, fmt.Errorf("auth: auth file: entry %q is missing task_queues", lookupKey)
+	}
+	out := make([]string, len(taskQueues))
+	for i, taskQueue := range taskQueues {
+		if taskQueue == "" {
+			return nil, fmt.Errorf("auth: auth file: entry %q has empty task_queues[%d]", lookupKey, i)
+		}
+		out[i] = taskQueue
+	}
+	return out, nil
 }
 
 // StaticAuthenticator authenticates API keys against a fixed, file-loaded

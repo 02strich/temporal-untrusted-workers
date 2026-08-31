@@ -1,7 +1,7 @@
 // Command temporal-proxy runs a gRPC proxy that sits between untrusted
 // Temporal workers and a real Temporal server, allowing through only the
 // worker task-processing RPCs and pinning each authenticated identity to a
-// single namespace + task queue.
+// single namespace and one or more task queues.
 package main
 
 import (

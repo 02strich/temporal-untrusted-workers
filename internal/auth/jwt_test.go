@@ -30,7 +30,7 @@ func staticEmail(email string) func(context.Context, string) (string, error) {
 func TestJWTAuthenticator_ValidEmail(t *testing.T) {
 	path := writeStaticAuthFile(t, `{
 		"emails": {
-			"sa@project.iam.gserviceaccount.com": {"namespace": "default", "task_queue": "proxy-test-queue", "subject": "worker-fleet-a"}
+			"sa@project.iam.gserviceaccount.com": {"namespace": "default", "task_queues": ["proxy-test-queue"], "subject": "worker-fleet-a"}
 		}
 	}`)
 
@@ -43,15 +43,33 @@ func TestJWTAuthenticator_ValidEmail(t *testing.T) {
 	if !identity.Valid {
 		t.Fatalf("expected valid identity, got %+v", identity)
 	}
-	if identity.Namespace != "default" || identity.TaskQueue != "proxy-test-queue" || identity.Subject != "worker-fleet-a" {
+	if identity.Namespace != "default" || !identity.AllowsTaskQueue("proxy-test-queue") || identity.Subject != "worker-fleet-a" {
 		t.Fatalf("unexpected identity: %+v", identity)
+	}
+}
+
+func TestJWTAuthenticator_MultipleTaskQueues(t *testing.T) {
+	path := writeStaticAuthFile(t, `{
+		"emails": {
+			"sa@project.iam.gserviceaccount.com": {"namespace": "default", "task_queues": ["queue-a", "queue-b"]}
+		}
+	}`)
+
+	a := newJWTAuthenticator(t, path, staticEmail("sa@project.iam.gserviceaccount.com"))
+
+	identity, err := a.Authenticate(context.Background(), "any-token")
+	if err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+	if !identity.AllowsTaskQueue("queue-a") || !identity.AllowsTaskQueue("queue-b") || identity.AllowsTaskQueue("queue-c") {
+		t.Fatalf("unexpected task queue authorization: %+v", identity)
 	}
 }
 
 func TestJWTAuthenticator_UnknownEmail(t *testing.T) {
 	path := writeStaticAuthFile(t, `{
 		"emails": {
-			"sa@project.iam.gserviceaccount.com": {"namespace": "default", "task_queue": "proxy-test-queue"}
+			"sa@project.iam.gserviceaccount.com": {"namespace": "default", "task_queues": ["proxy-test-queue"]}
 		}
 	}`)
 
@@ -69,7 +87,7 @@ func TestJWTAuthenticator_UnknownEmail(t *testing.T) {
 func TestJWTAuthenticator_ValidationError(t *testing.T) {
 	path := writeStaticAuthFile(t, `{
 		"emails": {
-			"sa@project.iam.gserviceaccount.com": {"namespace": "default", "task_queue": "proxy-test-queue"}
+			"sa@project.iam.gserviceaccount.com": {"namespace": "default", "task_queues": ["proxy-test-queue"]}
 		}
 	}`)
 
@@ -90,7 +108,7 @@ func TestJWTAuthenticator_ValidationError(t *testing.T) {
 func TestJWTAuthenticator_SubjectDefaultsToEmail(t *testing.T) {
 	path := writeStaticAuthFile(t, `{
 		"emails": {
-			"sa@project.iam.gserviceaccount.com": {"namespace": "default", "task_queue": "proxy-test-queue"}
+			"sa@project.iam.gserviceaccount.com": {"namespace": "default", "task_queues": ["proxy-test-queue"]}
 		}
 	}`)
 
@@ -106,15 +124,15 @@ func TestJWTAuthenticator_SubjectDefaultsToEmail(t *testing.T) {
 // only the "emails" section of the unified file, not "keys".
 func TestJWTAuthenticator_IgnoresKeysSection(t *testing.T) {
 	path := writeStaticAuthFile(t, `{
-		"keys":   {"some-api-key": {"namespace": "default", "task_queue": "key-queue"}},
-		"emails": {"sa@project.iam.gserviceaccount.com": {"namespace": "default", "task_queue": "email-queue"}}
+		"keys":   {"some-api-key": {"namespace": "default", "task_queues": ["key-queue"]}},
+		"emails": {"sa@project.iam.gserviceaccount.com": {"namespace": "default", "task_queues": ["email-queue"]}}
 	}`)
 
 	a := newJWTAuthenticator(t, path, staticEmail("sa@project.iam.gserviceaccount.com"))
 
 	identity, _ := a.Authenticate(context.Background(), "any-token")
-	if identity.TaskQueue != "email-queue" {
-		t.Fatalf("expected email-queue from emails section, got %q", identity.TaskQueue)
+	if !identity.AllowsTaskQueue("email-queue") {
+		t.Fatalf("expected email-queue from emails section, got %+v", identity)
 	}
 }
 
@@ -128,7 +146,7 @@ func TestJWTAuthenticator_MissingField(t *testing.T) {
 	}
 	cfg, _ := loadAuthFile(path)
 	if _, err := buildIdentities(cfg.Emails, false); err == nil {
-		t.Fatalf("expected error for email entry missing task_queue")
+		t.Fatalf("expected error for email entry missing task_queues")
 	}
 }
 
@@ -144,7 +162,7 @@ func TestNewJWTAuthenticatorFromFile_RequiresAudience(t *testing.T) {
 // credentials - Google's certs are only fetched lazily at Validate time.
 func TestNewJWTAuthenticatorFromFile_Constructs(t *testing.T) {
 	path := writeStaticAuthFile(t, `{
-		"emails": {"sa@project.iam.gserviceaccount.com": {"namespace": "default", "task_queue": "proxy-test-queue"}}
+		"emails": {"sa@project.iam.gserviceaccount.com": {"namespace": "default", "task_queues": ["proxy-test-queue"]}}
 	}`)
 
 	a, err := NewJWTAuthenticatorFromFile(context.Background(), path, "https://proxy.example.com")
