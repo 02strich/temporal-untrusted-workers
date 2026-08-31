@@ -49,6 +49,8 @@ before any request is forwarded. For each incoming call it:
      (`internal/tokencache`).
    - `PollNexusTaskQueue` also validates embedded worker heartbeat entries against the identity's
      task queue before forwarding.
+   - `DescribeNamespace` responses have the namespace `worker_commands` capability masked off before
+     returning to the worker.
    - `RecordWorkerHeartbeat` must target the identity's namespace, and every reported heartbeat entry
      must target the identity's task queue.
    - `RespondWorkflowTaskCompleted` additionally has every emitted **command** validated so a

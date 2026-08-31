@@ -73,7 +73,12 @@ func (s *Server) GetSystemInfo(ctx context.Context, req *workflowservice.GetSyst
 }
 
 func (s *Server) DescribeNamespace(ctx context.Context, req *workflowservice.DescribeNamespaceRequest) (*workflowservice.DescribeNamespaceResponse, error) {
-	return s.Upstream.DescribeNamespace(ctx, req)
+	resp, err := s.Upstream.DescribeNamespace(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	disableWorkerCommandsCapability(resp)
+	return resp, nil
 }
 
 func (s *Server) ShutdownWorker(ctx context.Context, req *workflowservice.ShutdownWorkerRequest) (*workflowservice.ShutdownWorkerResponse, error) {
@@ -82,4 +87,11 @@ func (s *Server) ShutdownWorker(ctx context.Context, req *workflowservice.Shutdo
 
 func (s *Server) RecordWorkerHeartbeat(ctx context.Context, req *workflowservice.RecordWorkerHeartbeatRequest) (*workflowservice.RecordWorkerHeartbeatResponse, error) {
 	return s.Upstream.RecordWorkerHeartbeat(ctx, req)
+}
+
+func disableWorkerCommandsCapability(resp *workflowservice.DescribeNamespaceResponse) {
+	if resp == nil || resp.NamespaceInfo == nil || resp.NamespaceInfo.Capabilities == nil {
+		return
+	}
+	resp.NamespaceInfo.Capabilities.WorkerCommands = false
 }
