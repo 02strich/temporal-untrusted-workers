@@ -1,0 +1,37 @@
+{
+  "name": "@02strich/temporal-dynamic-loading-demo",
+  "private": true,
+  "version": "1.0.0",
+  "description": "",
+  "scripts": {
+    "build": "tsc --build",
+    "build:bundles": "tsx ./src/build-workflow-bundles.ts",
+    "prepare-demo": "pnpm run build && pnpm run build:bundles",
+    "workers": "node ./lib/run-workers.js",
+    "start-workflows": "node ./lib/start-workflows.js",
+    "test": "pnpm run build && pnpm run build:bundles && node --test ./lib/*.test.js"
+  },
+  "dependencies": {
+    "@temporalio/client": "^1.23.0",
+    "@temporalio/envconfig": "^1.23.0",
+    "@temporalio/worker": "^1.23.0",
+    "@temporalio/workflow": "^1.23.0"
+  },
+  "devDependencies": {
+    "@temporalio/testing": "^1.23.0",
+    "@tsconfig/node20": "^20.1.4",
+    "@types/node": "^20.19.39",
+    "tsx": "^4.20.6",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">= 20.3.0"
+  },
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": "22.x",
+      "onFail": "download"
+    }
+  }
+}

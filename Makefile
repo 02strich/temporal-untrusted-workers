@@ -57,6 +57,14 @@ image-verify-worker-ts: check-docker check-repo
 		--label org.opencontainers.image.source=$(IMAGE_SOURCE) \
 		examples/verify-worker-ts
 
+image-dynamic-worker-ts: check-docker check-repo
+	docker buildx build \
+		--platform=$(PLATFORMS) \
+		--push \
+		-t $(KO_DOCKER_REPO)/dynamic-worker-ts:$(TAGS) \
+		--label org.opencontainers.image.source=$(IMAGE_SOURCE) \
+		examples/dynamic-worker-ts
+
 ko-install:
 	go install github.com/google/ko@latest
 
