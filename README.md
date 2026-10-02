@@ -222,6 +222,11 @@ TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_SERVICE=command-policy \
   go run ./cmd/temporal-proxy
 ```
 
+[`verifiers/cedar`](verifiers/cedar) is a policy-driven alternative written in Rust. Its rules are
+[Cedar](https://www.cedarpolicy.com) policies, so you can change them without writing code. Its
+`policies/builtin.cedar` reproduces the built-in policy, and it uses the same endpoint and
+environment variables as `cmd/example-verifier`.
+
 Run the verifier on trusted infrastructure, never behind the proxy itself: it decides what
 untrusted workers may do.
 

@@ -1,0 +1,19 @@
+[package]
+name = "cedar-verifier"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "temporal-proxy command verifier Nexus service backed by Cedar policies"
+publish = false
+
+[dependencies]
+anyhow = "1"
+cedar-policy = "4.13"
+serde_json = "1"
+temporalio-client = "~1.0.0"
+# vendored-protox compiles Temporal's protos without a system `protoc`.
+temporalio-common = { version = "~1.0.0", features = ["vendored-protox"] }
+temporalio-sdk-core = "~0.9.0"
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

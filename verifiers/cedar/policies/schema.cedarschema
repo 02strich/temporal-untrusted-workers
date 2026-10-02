@@ -1,0 +1,57 @@
+// Cedar schema for the temporal-proxy command verifier.
+//
+// Every command a worker emits in RespondWorkflowTaskCompleted is evaluated as
+// one authorization request:
+//   principal: the worker identity that completed the workflow task
+//   action:    the command type, e.g. Action::"ScheduleActivityTask"
+//   resource:  the task queue that issued the workflow task token
+//   context:   fields extracted from the command's attributes ("" when absent)
+
+// The calling worker identity, keyed by its subject.
+entity Worker = {
+  // The namespace the identity is pinned to.
+  namespace: String,
+  // Every task queue the identity is authorized for.
+  taskQueues: Set<String>,
+};
+
+// The task queue that issued the workflow task token being completed.
+entity TaskQueue = {
+  name: String,
+  namespace: String,
+};
+
+type CommandContext = {
+  // taskQueue.name of the command (activities, child workflows, continue-as-new).
+  targetTaskQueue: String,
+  // namespace of the command (child workflows, external signals/cancels).
+  targetNamespace: String,
+  // activityType.name of the command (ScheduleActivityTask).
+  activityType: String,
+  // workflowType.name of the command (child workflows, continue-as-new).
+  workflowType: String,
+};
+
+action
+  ScheduleActivityTask,
+  RequestCancelActivityTask,
+  StartTimer,
+  CompleteWorkflowExecution,
+  FailWorkflowExecution,
+  CancelTimer,
+  CancelWorkflowExecution,
+  RequestCancelExternalWorkflowExecution,
+  RecordMarker,
+  ContinueAsNewWorkflowExecution,
+  StartChildWorkflowExecution,
+  SignalExternalWorkflowExecution,
+  UpsertWorkflowSearchAttributes,
+  ProtocolMessage,
+  ModifyWorkflowProperties,
+  ScheduleNexusOperation,
+  RequestCancelNexusOperation
+  appliesTo {
+    principal: Worker,
+    resource: TaskQueue,
+    context: CommandContext,
+  };
