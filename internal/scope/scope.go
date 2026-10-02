@@ -1,8 +1,7 @@
 // Package scope extracts the namespace/task-queue/task-token scoping
-// information from the WorkflowService RPCs the proxy allows, and validates
-// that a RespondWorkflowTaskCompleted request's emitted commands don't
-// target anywhere outside the caller's authorized namespace and scoped task
-// queue.
+// information from the WorkflowService RPCs the proxy allows. Validation of
+// the commands a RespondWorkflowTaskCompleted request emits lives in package
+// commandpolicy.
 //
 // Extraction is done via explicit per-RPC type switches over the concrete
 // go.temporal.io/api generated structs rather than reflection: it is a
@@ -14,7 +13,6 @@ package scope
 import (
 	"fmt"
 
-	commandpb "go.temporal.io/api/command/v1"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	workerpb "go.temporal.io/api/worker/v1"
 	"go.temporal.io/api/workflowservice/v1"
@@ -194,51 +192,4 @@ func containsTaskQueue(taskQueues []string, taskQueue string) bool {
 		}
 	}
 	return false
-}
-
-// ValidateCommands checks every command emitted by a
-// RespondWorkflowTaskCompleted call against the caller's authorized namespace
-// and the task queue that issued the workflow task token. Only command types
-// that can direct work elsewhere are checked:
-//
-//   - ScheduleActivityTaskCommandAttributes: TaskQueue.Name must equal
-//     taskQueue. Activities are always scheduled in the workflow's own
-//     namespace (there is no namespace override on this command).
-//   - StartChildWorkflowExecutionCommandAttributes: TaskQueue.Name must equal
-//     taskQueue; Namespace, if set, must equal namespace (an empty Namespace
-//     means "same as parent").
-//   - ContinueAsNewWorkflowExecutionCommandAttributes: TaskQueue.Name, if
-//     set, must equal taskQueue (an empty TaskQueue means "same queue").
-//
-// All other command types (StartTimer, CompleteWorkflowExecution,
-// FailWorkflowExecution, RequestCancelActivityTask, CancelTimer,
-// CancelWorkflowExecution, RequestCancelExternalWorkflowExecution,
-// RecordMarker, SignalExternalWorkflowExecution,
-// UpsertWorkflowSearchAttributes, ProtocolMessage,
-// ModifyWorkflowProperties, Nexus operation commands, ...) carry no
-// task-queue/namespace targeting and are not checked.
-func ValidateCommands(commands []*commandpb.Command, namespace, taskQueue string) error {
-	for _, cmd := range commands {
-		switch attr := cmd.GetAttributes().(type) {
-		case *commandpb.Command_ScheduleActivityTaskCommandAttributes:
-			a := attr.ScheduleActivityTaskCommandAttributes
-			if tq := a.GetTaskQueue().GetName(); tq != taskQueue {
-				return fmt.Errorf("ScheduleActivityTask command targets task queue %q, not authorized queue %q", tq, taskQueue)
-			}
-		case *commandpb.Command_StartChildWorkflowExecutionCommandAttributes:
-			a := attr.StartChildWorkflowExecutionCommandAttributes
-			if tq := a.GetTaskQueue().GetName(); tq != taskQueue {
-				return fmt.Errorf("StartChildWorkflowExecution command targets task queue %q, not authorized queue %q", tq, taskQueue)
-			}
-			if ns := a.GetNamespace(); ns != "" && ns != namespace {
-				return fmt.Errorf("StartChildWorkflowExecution command targets namespace %q, not authorized namespace %q", ns, namespace)
-			}
-		case *commandpb.Command_ContinueAsNewWorkflowExecutionCommandAttributes:
-			a := attr.ContinueAsNewWorkflowExecutionCommandAttributes
-			if tq := a.GetTaskQueue().GetName(); tq != "" && tq != taskQueue {
-				return fmt.Errorf("ContinueAsNewWorkflowExecution command targets task queue %q, not authorized queue %q", tq, taskQueue)
-			}
-		}
-	}
-	return nil
 }

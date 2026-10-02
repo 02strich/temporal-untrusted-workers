@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+// Contract between temporal-proxy and an operator-provided command verifier
+// Nexus operation (TEMPORAL_PROXY_COMMAND_VERIFIER=nexus).
+//
+// The proxy sends VerifyCommandsRequest as a "json/protobuf" payload; the
+// operation must return VerifyCommandsResponse as a "json/protobuf" or
+// "binary/protobuf" payload (plain JSON in the protobuf JSON mapping also
+// works).
+package temporal_untrusted_workers.commandpolicy.v1;
+
+import "temporal/api/command/v1/message.proto";
+
+option go_package = "github.com/02strich/temporal-untrusted-workers/gen/commandpolicy/v1;commandpolicypb";
+
+// VerifyCommandsRequest describes one RespondWorkflowTaskCompleted call.
+message VerifyCommandsRequest {
+  // The namespace the calling worker identity is pinned to.
+  string namespace = 1;
+  // The task queue that issued the workflow task token being completed.
+  string task_queue = 2;
+  // Every task queue the calling identity is authorized for.
+  repeated string task_queues = 3;
+  // Optional label of the calling identity, for logging.
+  string subject = 4;
+  // The commands the worker emitted.
+  repeated temporal.api.command.v1.Command commands = 5;
+}
+
+// VerifyCommandsResponse is the verifier's decision. The zero value denies.
+message VerifyCommandsResponse {
+  // Whether the commands may be forwarded upstream.
+  bool allowed = 1;
+  // Why the commands were rejected; returned to the worker when allowed is false.
+  string reason = 2;
+}

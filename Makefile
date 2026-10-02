@@ -25,11 +25,18 @@
 # daemon.
 
 KO ?= ko
+# buf runs via `go run` at a pinned version, so no separate install is needed.
+BUF ?= go run github.com/bufbuild/buf/cmd/buf@v1.72.0
 TAGS ?= latest
 PLATFORMS ?= linux/amd64,linux/arm64
 IMAGE_SOURCE := https://github.com/02strich/temporal-untrusted-workers
 
-.PHONY: images image-proxy image-verify-worker image-verify-worker-ts ko-install check-ko check-docker check-repo
+.PHONY: generate images image-proxy image-verify-worker image-verify-worker-ts ko-install check-ko check-docker check-repo
+
+# Regenerates gen/ from proto/ (the command verifier Nexus contract).
+generate:
+	$(BUF) lint
+	$(BUF) generate
 
 images: image-proxy image-verify-worker image-verify-worker-ts
 

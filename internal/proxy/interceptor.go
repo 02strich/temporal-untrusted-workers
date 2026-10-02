@@ -18,6 +18,7 @@ import (
 
 	"github.com/02strich/temporal-untrusted-workers/internal/actions"
 	"github.com/02strich/temporal-untrusted-workers/internal/auth"
+	"github.com/02strich/temporal-untrusted-workers/internal/commandpolicy"
 	"github.com/02strich/temporal-untrusted-workers/internal/rpcpolicy"
 	"github.com/02strich/temporal-untrusted-workers/internal/scope"
 	"github.com/02strich/temporal-untrusted-workers/internal/tokencache"
@@ -37,10 +38,14 @@ func IdentityFromContext(ctx context.Context) (auth.Identity, bool) {
 
 // NewInterceptor builds the single unary server interceptor that enforces
 // the entire access-control policy: RPC allowlisting, downstream API-key
-// authentication, and namespace/task-queue/token scoping. It must run
-// before any handler - registering it via grpc.UnaryInterceptor on the
+// authentication, namespace/task-queue/token scoping, and verification of
+// workflow commands via verifier (commandpolicy.BuiltIn when nil). It must
+// run before any handler - registering it via grpc.UnaryInterceptor on the
 // server that hosts proxy.Server guarantees that.
-func NewInterceptor(authenticator auth.Authenticator, cache tokencache.Store) grpc.UnaryServerInterceptor {
+func NewInterceptor(authenticator auth.Authenticator, cache tokencache.Store, verifier commandpolicy.Verifier) grpc.UnaryServerInterceptor {
+	if verifier == nil {
+		verifier = commandpolicy.BuiltIn{}
+	}
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		rpcName := rpcNameFromFullMethod(info.FullMethod)
 
@@ -67,7 +72,7 @@ func NewInterceptor(authenticator auth.Authenticator, cache tokencache.Store) gr
 			return nil, status.Error(codes.Internal, "proxy: request does not implement proto.Message")
 		}
 
-		scopedTaskQueue, err := authorizeRequest(ctx, protoReq, rpcName, policy, identity, cache)
+		scopedTaskQueue, err := authorizeRequest(ctx, protoReq, rpcName, policy, identity, cache, verifier)
 		if err != nil {
 			slog.Warn("access denied", "rpc", rpcName, "subject", identity.Subject, "reason", err.Error())
 			return nil, grpcErrorForAuthorizationError(err)
@@ -136,6 +141,10 @@ func grpcErrorForAuthorizationError(err error) error {
 	if errors.As(err, &cacheErr) {
 		return status.Error(codes.Unavailable, "token cache unavailable")
 	}
+	var verifierErr commandpolicy.UnavailableError
+	if errors.As(err, &verifierErr) {
+		return status.Error(codes.Unavailable, "command verifier unavailable")
+	}
 	return status.Errorf(codes.PermissionDenied, "access denied: %s", err.Error())
 }
 
@@ -175,10 +184,10 @@ func extractAPIKey(ctx context.Context) (string, error) {
 
 // authorizeRequest checks req against identity's authorized namespace/task
 // queues, per policy.Category, and - for RespondWorkflowTaskCompleted -
-// additionally validates that none of the request's commands target anywhere
-// outside the queue that issued the workflow task token. It returns the
-// concrete task queue this request is scoped to, when one is established.
-func authorizeRequest(ctx context.Context, req proto.Message, rpcName string, policy rpcpolicy.Policy, identity auth.Identity, cache tokencache.Store) (string, error) {
+// additionally has verifier decide whether the request's commands may be
+// forwarded. It returns the concrete task queue this request is scoped to,
+// when one is established.
+func authorizeRequest(ctx context.Context, req proto.Message, rpcName string, policy rpcpolicy.Policy, identity auth.Identity, cache tokencache.Store, verifier commandpolicy.Verifier) (string, error) {
 	switch policy.Category {
 	case rpcpolicy.CategoryPoll:
 		ns, _ := scope.RequestNamespace(req)
@@ -231,7 +240,11 @@ func authorizeRequest(ctx context.Context, req proto.Message, rpcName string, po
 
 		if rpcName == "RespondWorkflowTaskCompleted" {
 			if r, ok := req.(*workflowservice.RespondWorkflowTaskCompletedRequest); ok {
-				if err := scope.ValidateCommands(r.GetCommands(), identity.Namespace, entry.TaskQueue); err != nil {
+				if err := verifier.Verify(ctx, commandpolicy.Request{
+					Identity:  identity,
+					TaskQueue: entry.TaskQueue,
+					Commands:  r.GetCommands(),
+				}); err != nil {
 					return "", err
 				}
 			}

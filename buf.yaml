@@ -1,0 +1,15 @@
+version: v2
+modules:
+  - path: proto
+deps:
+  - buf.build/temporalio/api
+lint:
+  use:
+    - STANDARD
+  except:
+    # Keep the proto package fully qualified (it appears in payload
+    # messageType metadata) without nesting the source tree to match it.
+    - PACKAGE_DIRECTORY_MATCH
+breaking:
+  use:
+    - FILE

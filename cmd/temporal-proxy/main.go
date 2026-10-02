@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc/credentials"
 
 	"github.com/02strich/temporal-untrusted-workers/internal/auth"
+	"github.com/02strich/temporal-untrusted-workers/internal/commandpolicy"
 	"github.com/02strich/temporal-untrusted-workers/internal/config"
 	"github.com/02strich/temporal-untrusted-workers/internal/proxy"
 	"github.com/02strich/temporal-untrusted-workers/internal/tokencache"
@@ -68,7 +69,9 @@ func run() error {
 		}
 	}()
 
-	serverOpts := []grpc.ServerOption{grpc.UnaryInterceptor(proxy.NewInterceptor(authenticator, cache))}
+	verifier := buildCommandVerifier(cfg.CommandVerifier, upstreamClient)
+
+	serverOpts := []grpc.ServerOption{grpc.UnaryInterceptor(proxy.NewInterceptor(authenticator, cache, verifier))}
 	if cfg.Downstream.TLSMode == config.TLSModeTLS {
 		creds, err := credentials.NewServerTLSFromFile(cfg.Downstream.CertFile, cfg.Downstream.KeyFile)
 		if err != nil {
@@ -90,7 +93,7 @@ func run() error {
 
 	serveErr := make(chan error, 1)
 	go func() {
-		slog.Info("temporal-proxy listening", "addr", cfg.Downstream.ListenAddr, "upstream", cfg.Upstream.Addr, "token_cache_backend", cfg.TokenCacheBackend)
+		slog.Info("temporal-proxy listening", "addr", cfg.Downstream.ListenAddr, "upstream", cfg.Upstream.Addr, "token_cache_backend", cfg.TokenCacheBackend, "command_verifier", cfg.CommandVerifier.Mode)
 		serveErr <- grpcServer.Serve(listener)
 	}()
 
@@ -133,6 +136,23 @@ func buildTokenCache(ctx context.Context, cfg config.Config) (tokencache.Store, 
 		})
 	default:
 		return tokencache.New(cfg.TokenCacheTTL, cfg.TokenCacheMaxSize), nil
+	}
+}
+
+// buildCommandVerifier returns the configured commandpolicy.Verifier. The
+// Nexus verifier runs its standalone Nexus operations over the upstream
+// connection, so it reuses the proxy's upstream credentials.
+func buildCommandVerifier(cfg config.CommandVerifierConfig, upstreamClient workflowservice.WorkflowServiceClient) commandpolicy.Verifier {
+	if cfg.Mode != config.CommandVerifierNexus {
+		return commandpolicy.BuiltIn{}
+	}
+	return &commandpolicy.NexusVerifier{
+		Client:    upstreamClient,
+		Namespace: cfg.NexusNamespace,
+		Endpoint:  cfg.NexusEndpoint,
+		Service:   cfg.NexusService,
+		Operation: cfg.NexusOperation,
+		Timeout:   cfg.Timeout,
 	}
 }
 
