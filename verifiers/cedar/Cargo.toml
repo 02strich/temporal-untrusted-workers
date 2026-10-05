@@ -3,7 +3,7 @@ name = "cedar-verifier"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
-description = "temporal-proxy command verifier Nexus service backed by Cedar policies"
+description = "temporal-proxy tool-call verifier Nexus service backed by Cedar policies"
 publish = false
 
 [dependencies]

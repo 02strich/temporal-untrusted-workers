@@ -1,0 +1,82 @@
+syntax = "proto3";
+
+// Contract between temporal-proxy and an operator-provided tool-call verifier
+// Nexus operation (TEMPORAL_PROXY_TOOL_VERIFIER=nexus).
+//
+// The proxy enforces the local rules itself: activities on the workflow's own
+// task queue are allowed, and child workflows / continue-as-new must stay on
+// that queue (and namespace). Work that leaves the worker's task queue is
+// expressed as tool calls and judged by the verifier:
+//
+//   - ScheduleNexusOperation         -> name "<endpoint>/<service>/<operation>",
+//                                       parameters: the input (zero or one)
+//   - ScheduleActivityTask on another task queue
+//                                    -> name "<taskQueue>/<activityType>",
+//                                       parameters: one per input argument
+//
+// Activities on the workflow's own task queue and RequestCancelNexusOperation
+// are not tool calls.
+//
+// Each input payload becomes one parameter, typed where possible:
+//
+//   - json/protobuf with messageType M: an Any of type M (its JSON fields).
+//   - binary/protobuf of a type the proxy knows (Temporal API and well-known
+//     types): an Any of that type.
+//   - binary/protobuf of any other type: the proxy rejects the workflow task,
+//     since it cannot render the parameter for verification. Send such inputs
+//     as json/protobuf instead.
+//   - json/plain: google.protobuf.Value; binary/plain: google.protobuf.BytesValue;
+//     binary/null: a null google.protobuf.Value.
+//   - anything else (e.g. encrypted payloads): the packed
+//     temporal.api.common.v1.Payload.
+//
+// The proxy sends VerifyToolCallsRequest as a "json/protobuf" payload, so a
+// verifier decoding it with a protobuf JSON decoder must be able to resolve the
+// parameter types it receives (or treat parameters as plain JSON). The
+// operation must return VerifyToolCallsResponse as a "json/protobuf" or
+// "binary/protobuf" payload (plain JSON in the protobuf JSON mapping also
+// works).
+package temporal_untrusted_workers.toolpolicy.v1;
+
+import "google/protobuf/any.proto";
+
+option go_package = "github.com/02strich/temporal-untrusted-workers/gen/toolpolicy/v1;toolpolicypb";
+
+// VerifyToolCallsRequest carries the tool calls of one workflow task
+// completion (RespondWorkflowTaskCompleted).
+message VerifyToolCallsRequest {
+  // The workflow making the tool calls.
+  Caller caller = 1;
+  // The tool calls, in command order.
+  repeated ToolCall tool_calls = 2;
+}
+
+// Caller identifies who makes the tool calls: the workflow whose task is being
+// completed, and the worker identity completing it.
+message Caller {
+  // The namespace of the workflow (the identity is pinned to it).
+  string namespace = 1;
+  // Optional label of the worker identity, for logging.
+  string subject = 2;
+  // The task queue that issued the workflow task token being completed.
+  string task_queue = 3;
+  // The ID of the workflow whose task is being completed.
+  string workflow_id = 4;
+}
+
+// ToolCall is one call that leaves the worker's own task queue.
+message ToolCall {
+  // "<endpoint>/<service>/<operation>" for Nexus operations,
+  // "<taskQueue>/<activityType>" for activities on another task queue.
+  string name = 1;
+  // The call's inputs, one per input payload.
+  repeated google.protobuf.Any parameters = 2;
+}
+
+// VerifyToolCallsResponse is the verifier's decision. The zero value denies.
+message VerifyToolCallsResponse {
+  // Whether all tool calls may be forwarded upstream.
+  bool allowed = 1;
+  // Why the tool calls were rejected; returned to the worker when allowed is false.
+  string reason = 2;
+}

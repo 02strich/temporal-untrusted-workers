@@ -1,10 +1,10 @@
-//! A temporal-proxy command verifier (TEMPORAL_PROXY_COMMAND_VERIFIER=nexus)
+//! A temporal-proxy tool-call verifier (TEMPORAL_PROXY_TOOL_VERIFIER=nexus)
 //! whose rules are Cedar policies.
 //!
 //! The Temporal Rust SDK has no Nexus handler API yet, so this runs a
 //! Nexus-only worker directly on temporalio-sdk-core: it polls Nexus tasks,
-//! evaluates each `VerifyCommands` start request with [`policy::PolicyEngine`],
-//! and completes it synchronously with a `VerifyCommandsResponse`.
+//! evaluates each `VerifyToolCalls` start request with [`policy::PolicyEngine`],
+//! and completes it synchronously with a `VerifyToolCallsResponse`.
 
 mod policy;
 
@@ -37,7 +37,7 @@ use crate::policy::{PolicyEngine, Verdict};
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 const RESPONSE_MESSAGE_TYPE: &str =
-    "temporal_untrusted_workers.commandpolicy.v1.VerifyCommandsResponse";
+    "temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsResponse";
 
 struct Config {
     address: String,
@@ -57,10 +57,10 @@ impl Config {
             address: get("TEMPORAL_ADDRESS", "http://127.0.0.1:7233"),
             namespace: get("TEMPORAL_NAMESPACE", "default"),
             api_key: env::var("TEMPORAL_API_KEY").ok().filter(|k| !k.is_empty()),
-            task_queue: get("VERIFIER_TASK_QUEUE", "command-verifier"),
-            service: get("VERIFIER_SERVICE", "command-policy"),
-            operation: get("VERIFIER_OPERATION", "VerifyCommands"),
-            policy_file: get("CEDAR_POLICY_FILE", "policies/builtin.cedar"),
+            task_queue: get("VERIFIER_TASK_QUEUE", "tool-verifier"),
+            service: get("VERIFIER_SERVICE", "tool-policy"),
+            operation: get("VERIFIER_OPERATION", "VerifyToolCalls"),
+            policy_file: get("CEDAR_POLICY_FILE", "policies/example.cedar"),
             schema_file: env::var("CEDAR_SCHEMA_FILE").ok().filter(|f| !f.is_empty()),
         }
     }
@@ -227,7 +227,7 @@ impl Handler {
             Some(request::Variant::StartOperation(start)) => self.start_operation(start),
             Some(request::Variant::CancelOperation(_)) => handler_error(
                 "NOT_IMPLEMENTED",
-                "VerifyCommands is synchronous and cannot be cancelled",
+                "VerifyToolCalls is synchronous and cannot be cancelled",
             ),
             None => handler_error("BAD_REQUEST", "nexus task has no request"),
         };
@@ -257,12 +257,12 @@ impl Handler {
                 tracing::warn!(error = %format!("{err:#}"), "rejecting malformed verify request");
                 return handler_error(
                     "BAD_REQUEST",
-                    &format!("invalid VerifyCommandsRequest: {err:#}"),
+                    &format!("invalid VerifyToolCallsRequest: {err:#}"),
                 );
             }
         };
         if !verdict.allowed {
-            tracing::info!(reason = %verdict.reason, "commands denied");
+            tracing::info!(reason = %verdict.reason, "tool calls denied");
         }
         nexus_task_completion::Status::Completed(Response {
             variant: Some(response::Variant::StartOperation(StartOperationResponse {
@@ -277,7 +277,7 @@ impl Handler {
     }
 }
 
-/// Encodes a verdict as a `VerifyCommandsResponse` in the protobuf JSON mapping.
+/// Encodes a verdict as a `VerifyToolCallsResponse` in the protobuf JSON mapping.
 fn response_payload(verdict: &Verdict) -> Payload {
     let body = serde_json::json!({ "allowed": verdict.allowed, "reason": verdict.reason });
     Payload {

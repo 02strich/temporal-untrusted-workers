@@ -33,12 +33,12 @@ IMAGE_SOURCE := https://github.com/02strich/temporal-untrusted-workers
 
 .PHONY: generate test-cedar-verifier images image-proxy image-verify-worker image-verify-worker-ts ko-install check-ko check-docker check-repo
 
-# Regenerates gen/ from proto/ (the command verifier Nexus contract).
+# Regenerates gen/ from proto/ (the tool verifier Nexus contract).
 generate:
 	$(BUF) lint
 	$(BUF) generate
 
-# Tests the Rust/Cedar command verifier (verifiers/cedar, a Cargo crate).
+# Tests the Rust/Cedar tool verifier (verifiers/cedar, a Cargo crate).
 test-cedar-verifier:
 	cd verifiers/cedar && cargo test
 

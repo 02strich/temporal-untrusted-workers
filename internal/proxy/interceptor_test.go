@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"slices"
 	"testing"
 	"time"
 
 	commandpb "go.temporal.io/api/command/v1"
+	commonpb "go.temporal.io/api/common/v1"
 	enums "go.temporal.io/api/enums/v1"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	workerpb "go.temporal.io/api/worker/v1"
@@ -21,8 +23,8 @@ import (
 
 	"github.com/02strich/temporal-untrusted-workers/internal/actions"
 	"github.com/02strich/temporal-untrusted-workers/internal/auth"
-	"github.com/02strich/temporal-untrusted-workers/internal/commandpolicy"
 	"github.com/02strich/temporal-untrusted-workers/internal/tokencache"
+	"github.com/02strich/temporal-untrusted-workers/internal/toolpolicy"
 )
 
 type fakeAuthenticator struct {
@@ -1007,15 +1009,48 @@ func TestInterceptor_AllowsCommandTargetingOwnQueue(t *testing.T) {
 
 type fakeVerifier struct {
 	err  error
-	reqs []commandpolicy.Request
+	reqs []toolpolicy.Request
 }
 
-func (f *fakeVerifier) Verify(_ context.Context, req commandpolicy.Request) error {
+func (f *fakeVerifier) Verify(_ context.Context, req toolpolicy.Request) error {
 	f.reqs = append(f.reqs, req)
 	return f.err
 }
 
-func callWithVerifier(t *testing.T, verifier commandpolicy.Verifier) (error, bool) {
+func scheduleActivity(taskQueue string) *commandpb.Command {
+	return &commandpb.Command{
+		Attributes: &commandpb.Command_ScheduleActivityTaskCommandAttributes{
+			ScheduleActivityTaskCommandAttributes: &commandpb.ScheduleActivityTaskCommandAttributes{
+				ActivityType: &commonpb.ActivityType{Name: "SendEmail"},
+				TaskQueue:    &taskqueuepb.TaskQueue{Name: taskQueue},
+			},
+		},
+	}
+}
+
+func scheduleNexus() *commandpb.Command {
+	return &commandpb.Command{
+		Attributes: &commandpb.Command_ScheduleNexusOperationCommandAttributes{
+			ScheduleNexusOperationCommandAttributes: &commandpb.ScheduleNexusOperationCommandAttributes{
+				Endpoint: "payments", Service: "billing", Operation: "Charge",
+			},
+		},
+	}
+}
+
+func startChild(taskQueue string) *commandpb.Command {
+	return &commandpb.Command{
+		Attributes: &commandpb.Command_StartChildWorkflowExecutionCommandAttributes{
+			StartChildWorkflowExecutionCommandAttributes: &commandpb.StartChildWorkflowExecutionCommandAttributes{
+				TaskQueue: &taskqueuepb.TaskQueue{Name: taskQueue},
+			},
+		},
+	}
+}
+
+// completeWorkflowTask polls a workflow task for wf-1 on queue-a (so its token
+// is registered with the workflow ID) and completes it with commands.
+func completeWorkflowTask(t *testing.T, verifier toolpolicy.Verifier, commands ...*commandpb.Command) (error, bool) {
 	t.Helper()
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{
 		"key-a": {Valid: true, Namespace: "ns", TaskQueues: []string{"queue-a", "queue-b"}, Subject: "fleet-a"},
@@ -1024,60 +1059,94 @@ func callWithVerifier(t *testing.T, verifier commandpolicy.Verifier) (error, boo
 	defer cache.Close()
 	interceptor := NewInterceptor(authr, cache, verifier)
 
-	putCache(t, cache, []byte("wt-tok"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
-
-	// The command targets queue-b, which the built-in policy would reject.
-	req := &workflowservice.RespondWorkflowTaskCompletedRequest{
-		Namespace: "ns",
-		TaskToken: []byte("wt-tok"),
-		Commands: []*commandpb.Command{
-			{
-				Attributes: &commandpb.Command_ScheduleActivityTaskCommandAttributes{
-					ScheduleActivityTaskCommandAttributes: &commandpb.ScheduleActivityTaskCommandAttributes{
-						TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-b"},
-					},
-				},
-			},
-		},
+	_, err, _ := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
+		"/temporal.api.workflowservice.v1.WorkflowService/PollWorkflowTaskQueue",
+		&workflowservice.PollWorkflowTaskQueueRequest{Namespace: "ns", TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-a"}},
+		&workflowservice.PollWorkflowTaskQueueResponse{TaskToken: []byte("wt-tok"), WorkflowExecution: &commonpb.WorkflowExecution{WorkflowId: "wf-1"}}, nil)
+	if err != nil {
+		t.Fatalf("poll: %v", err)
 	}
 
+	req := &workflowservice.RespondWorkflowTaskCompletedRequest{Namespace: "ns", TaskToken: []byte("wt-tok"), Commands: commands}
 	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
 		"/temporal.api.workflowservice.v1.WorkflowService/RespondWorkflowTaskCompleted",
 		req, &workflowservice.RespondWorkflowTaskCompletedResponse{}, nil)
 	return err, called
 }
 
-func TestInterceptor_CustomVerifierReplacesBuiltIn(t *testing.T) {
+func TestInterceptor_ToolCallsGoToVerifier(t *testing.T) {
 	verifier := &fakeVerifier{}
-	err, called := callWithVerifier(t, verifier)
+	err, called := completeWorkflowTask(t, verifier, scheduleActivity("queue-a"), scheduleNexus(), scheduleActivity("trusted-tools"))
 	if !called || err != nil {
-		t.Fatalf("expected the custom verifier's allow to win over the built-in policy, called=%v err=%v", called, err)
+		t.Fatalf("expected the verifier's allow to forward the call, called=%v err=%v", called, err)
 	}
 
 	if len(verifier.reqs) != 1 {
 		t.Fatalf("expected one verifier call, got %d", len(verifier.reqs))
 	}
 	got := verifier.reqs[0]
-	if got.Identity.Namespace != "ns" || got.Identity.Subject != "fleet-a" || got.TaskQueue != "queue-a" || len(got.Commands) != 1 {
+	if got.Identity.Subject != "fleet-a" || got.TaskQueue != "queue-a" || got.WorkflowID != "wf-1" {
 		t.Fatalf("unexpected verifier request: %+v", got)
+	}
+	var names []string
+	for _, c := range got.Calls {
+		names = append(names, c.Name)
+	}
+	if want := []string{"payments/billing/Charge", "trusted-tools/SendEmail"}; !slices.Equal(names, want) {
+		t.Fatalf("tool calls %v, want %v", names, want)
 	}
 }
 
-func TestInterceptor_CustomVerifierDenies(t *testing.T) {
-	err, called := callWithVerifier(t, &fakeVerifier{err: commandpolicy.DeniedError{Reason: "no activities"}})
+func TestInterceptor_NoToolCallsSkipsVerifier(t *testing.T) {
+	verifier := &fakeVerifier{err: toolpolicy.DeniedError{Reason: "must not be asked"}}
+	err, called := completeWorkflowTask(t, verifier, scheduleActivity("queue-a"))
+	if !called || err != nil {
+		t.Fatalf("expected a same-queue activity to pass, called=%v err=%v", called, err)
+	}
+	if len(verifier.reqs) != 0 {
+		t.Fatalf("verifier must not be called without tool calls")
+	}
+}
+
+func TestInterceptor_LocalRulesApplyRegardlessOfVerifier(t *testing.T) {
+	verifier := &fakeVerifier{}
+	err, called := completeWorkflowTask(t, verifier, startChild("queue-b"), scheduleNexus())
+	if called {
+		t.Fatalf("handler must not run for a cross-queue child workflow")
+	}
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied, got %v", err)
+	}
+	if len(verifier.reqs) != 0 {
+		t.Fatalf("verifier must not be called when the local rules already deny")
+	}
+}
+
+func TestInterceptor_DefaultVerifier(t *testing.T) {
+	if err, called := completeWorkflowTask(t, nil, scheduleNexus()); !called || err != nil {
+		t.Fatalf("default mode must allow Nexus calls, called=%v err=%v", called, err)
+	}
+	err, called := completeWorkflowTask(t, nil, scheduleActivity("trusted-tools"))
+	if called || status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("default mode must deny cross-queue activities, called=%v err=%v", called, err)
+	}
+}
+
+func TestInterceptor_VerifierDenies(t *testing.T) {
+	err, called := completeWorkflowTask(t, &fakeVerifier{err: toolpolicy.DeniedError{Reason: "no payments"}}, scheduleNexus())
 	if called {
 		t.Fatalf("handler must not run when the verifier denies")
 	}
 	if status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("expected PermissionDenied, got %v", err)
 	}
-	if got := status.Convert(err).Message(); got != "access denied: no activities" {
+	if got := status.Convert(err).Message(); got != "access denied: no payments" {
 		t.Fatalf("unexpected message %q", got)
 	}
 }
 
-func TestInterceptor_CustomVerifierUnavailableFailsClosed(t *testing.T) {
-	err, called := callWithVerifier(t, &fakeVerifier{err: commandpolicy.UnavailableError{Err: errors.New("timeout")}})
+func TestInterceptor_VerifierUnavailableFailsClosed(t *testing.T) {
+	err, called := completeWorkflowTask(t, &fakeVerifier{err: toolpolicy.UnavailableError{Err: errors.New("timeout")}}, scheduleNexus())
 	if called {
 		t.Fatalf("handler must not run when the verifier is unavailable")
 	}

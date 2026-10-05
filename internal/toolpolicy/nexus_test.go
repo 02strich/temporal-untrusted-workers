@@ -1,4 +1,4 @@
-package commandpolicy
+package toolpolicy
 
 import (
 	"context"
@@ -15,8 +15,9 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
 
-	commandpolicypb "github.com/02strich/temporal-untrusted-workers/gen/commandpolicy/v1"
+	toolpolicypb "github.com/02strich/temporal-untrusted-workers/gen/toolpolicy/v1"
 	"github.com/02strich/temporal-untrusted-workers/internal/auth"
 )
 
@@ -83,18 +84,33 @@ func newTestVerifier(client *fakeNexusClient) *NexusVerifier {
 }
 
 func testRequest() Request {
-	return Request{
-		Identity:  auth.Identity{Valid: true, Namespace: "ns-a", TaskQueues: []string{"queue-a", "queue-b"}, Subject: "fleet-a"},
-		TaskQueue: "queue-a",
-		Commands: []*commandpb.Command{{
-			CommandType: enumspb.COMMAND_TYPE_SCHEDULE_ACTIVITY_TASK,
-			Attributes: &commandpb.Command_ScheduleActivityTaskCommandAttributes{
-				ScheduleActivityTaskCommandAttributes: &commandpb.ScheduleActivityTaskCommandAttributes{
-					ActivityId: "act-1",
-					TaskQueue:  &taskqueuepb.TaskQueue{Name: "queue-a"},
+	commands := []*commandpb.Command{
+		{
+			Attributes: &commandpb.Command_ScheduleNexusOperationCommandAttributes{
+				ScheduleNexusOperationCommandAttributes: &commandpb.ScheduleNexusOperationCommandAttributes{
+					Endpoint:  "payments",
+					Service:   "billing",
+					Operation: "Charge",
+					Input:     jsonPlainPayload(`{"amount":500,"currency":"USD"}`),
 				},
 			},
-		}},
+		},
+		{
+			Attributes: &commandpb.Command_ScheduleActivityTaskCommandAttributes{
+				ScheduleActivityTaskCommandAttributes: &commandpb.ScheduleActivityTaskCommandAttributes{
+					ActivityId:   "act-1",
+					ActivityType: &commonpb.ActivityType{Name: "SendEmail"},
+					TaskQueue:    &taskqueuepb.TaskQueue{Name: "trusted-tools"},
+					Input:        &commonpb.Payloads{Payloads: []*commonpb.Payload{jsonPlainPayload(`"a@example.com"`)}},
+				},
+			},
+		},
+	}
+	return Request{
+		Identity:   auth.Identity{Valid: true, Namespace: "ns-a", TaskQueues: []string{"queue-a", "queue-b"}, Subject: "fleet-a"},
+		TaskQueue:  "queue-a",
+		WorkflowID: "wf-1",
+		Calls:      FromCommands(commands, "queue-a"),
 	}
 }
 
@@ -134,18 +150,55 @@ func TestNexusVerifier_InputPayload(t *testing.T) {
 	if enc := string(input.GetMetadata()["encoding"]); enc != "json/protobuf" {
 		t.Fatalf("expected json/protobuf encoding, got %q", enc)
 	}
-	if mt := string(input.GetMetadata()["messageType"]); mt != "temporal_untrusted_workers.commandpolicy.v1.VerifyCommandsRequest" {
+	if mt := string(input.GetMetadata()["messageType"]); mt != "temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsRequest" {
 		t.Fatalf("unexpected messageType %q", mt)
 	}
-	var got commandpolicypb.VerifyCommandsRequest
+	// The hand-built JSON must be a valid protobuf JSON encoding of the
+	// generated message (the parameter types here are well-known types, so
+	// the global registry resolves them).
+	var got toolpolicypb.VerifyToolCallsRequest
 	if err := protojson.Unmarshal(input.GetData(), &got); err != nil {
 		t.Fatalf("decoding input: %v", err)
 	}
-	if got.GetNamespace() != "ns-a" || got.GetTaskQueue() != "queue-a" || got.GetSubject() != "fleet-a" || len(got.GetTaskQueues()) != 2 {
-		t.Fatalf("unexpected input: %v", &got)
+	caller := got.GetCaller()
+	if caller.GetNamespace() != "ns-a" || caller.GetTaskQueue() != "queue-a" || caller.GetSubject() != "fleet-a" || caller.GetWorkflowId() != "wf-1" {
+		t.Fatalf("unexpected caller: %v", caller)
 	}
-	if cmds := got.GetCommands(); len(cmds) != 1 || cmds[0].GetScheduleActivityTaskCommandAttributes().GetActivityId() != "act-1" {
-		t.Fatalf("commands did not round-trip: %v", cmds)
+	calls := got.GetToolCalls()
+	if len(calls) != 2 || calls[0].GetName() != "payments/billing/Charge" || calls[1].GetName() != "trusted-tools/SendEmail" {
+		t.Fatalf("unexpected tool calls: %v", calls)
+	}
+	value := &structpb.Value{}
+	if err := calls[0].GetParameters()[0].UnmarshalTo(value); err != nil {
+		t.Fatalf("parameter is not a google.protobuf.Value: %v", err)
+	}
+	if amount := value.GetStructValue().GetFields()["amount"].GetNumberValue(); amount != 500 {
+		t.Fatalf("parameter did not round-trip: %v", value)
+	}
+}
+
+func TestNexusVerifier_UnrenderableParameterDeniesWithoutRPC(t *testing.T) {
+	req := testRequest()
+	req.Calls = FromCommands([]*commandpb.Command{{
+		Attributes: &commandpb.Command_ScheduleNexusOperationCommandAttributes{
+			ScheduleNexusOperationCommandAttributes: &commandpb.ScheduleNexusOperationCommandAttributes{
+				Endpoint: "e", Service: "s", Operation: "o",
+				Input: &commonpb.Payload{
+					Metadata: map[string][]byte{"encoding": []byte("binary/protobuf"), "messageType": []byte("acme.v1.Secret")},
+					Data:     []byte{0x0a, 0x01, 0x78},
+				},
+			},
+		},
+	}}, "queue-a")
+
+	client := &fakeNexusClient{}
+	err := newTestVerifier(client).Verify(context.Background(), req)
+	var denied DeniedError
+	if !errors.As(err, &denied) {
+		t.Fatalf("expected DeniedError, got %T: %v", err, err)
+	}
+	if len(client.starts) != 0 {
+		t.Fatalf("verifier must not be called for an unrenderable parameter")
 	}
 }
 
@@ -159,7 +212,7 @@ func TestNexusVerifier_Denied(t *testing.T) {
 }
 
 func TestNexusVerifier_BinaryProtoResult(t *testing.T) {
-	data, err := proto.Marshal(&commandpolicypb.VerifyCommandsResponse{Allowed: false, Reason: "binary says no"})
+	data, err := proto.Marshal(&toolpolicypb.VerifyToolCallsResponse{Allowed: false, Reason: "binary says no"})
 	if err != nil {
 		t.Fatal(err)
 	}

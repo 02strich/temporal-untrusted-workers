@@ -14,7 +14,7 @@ func TestCache_PutGet(t *testing.T) {
 	defer c.Close()
 
 	token := []byte("token-a")
-	if err := c.Put(testContext, token, Entry{Namespace: "ns", TaskQueue: "queue-a"}); err != nil {
+	if err := c.Put(testContext, token, Entry{Namespace: "ns", TaskQueue: "queue-a", WorkflowID: "wf-1"}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
@@ -25,7 +25,7 @@ func TestCache_PutGet(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected token to be found")
 	}
-	if entry.Namespace != "ns" || entry.TaskQueue != "queue-a" {
+	if entry.Namespace != "ns" || entry.TaskQueue != "queue-a" || entry.WorkflowID != "wf-1" {
 		t.Fatalf("unexpected entry: %+v", entry)
 	}
 }

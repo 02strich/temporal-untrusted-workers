@@ -1,8 +1,8 @@
-//! Evaluates a `VerifyCommandsRequest` against Cedar policies.
+//! Evaluates a `VerifyToolCallsRequest` against Cedar policies.
 //!
-//! Every command becomes one Cedar authorization request (see
-//! `policies/schema.cedarschema` for the model); the call is allowed only if
-//! every command is.
+//! Every tool call becomes one Cedar authorization request (see
+//! `policies/schema.cedarschema` for the model); the request is allowed only
+//! if every tool call is.
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -12,9 +12,9 @@ use cedar_policy::{
     Authorizer, Context, Decision, Entities, Entity, EntityId, EntityTypeName, EntityUid,
     PolicySet, Request, RestrictedExpression, Schema, ValidationMode, Validator,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 
-/// The verdict returned to the proxy as a `VerifyCommandsResponse`.
+/// The verdict returned to the proxy as a `VerifyToolCallsResponse`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Verdict {
     pub allowed: bool,
@@ -66,25 +66,18 @@ impl PolicyEngine {
         })
     }
 
-    /// Decides a `VerifyCommandsRequest`, given in the protobuf JSON mapping.
+    /// Decides a `VerifyToolCallsRequest`, given in the protobuf JSON mapping.
     /// Errors mean the input could not be interpreted.
     pub fn verify(&self, request: &Value) -> anyhow::Result<Verdict> {
-        let namespace = string_field(request, "namespace", "namespace");
-        let task_queue = string_field(request, "taskQueue", "task_queue");
-        let subject = string_field(request, "subject", "subject");
-        let task_queues: Vec<String> = field(request, "taskQueues", "task_queues")
-            .and_then(Value::as_array)
-            .map(|qs| {
-                qs.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let commands = match field(request, "commands", "commands") {
+        let caller = field(request, "caller", "caller").unwrap_or(&Value::Null);
+        let namespace = string_field(caller, "namespace", "namespace");
+        let subject = string_field(caller, "subject", "subject");
+        let task_queue = string_field(caller, "taskQueue", "task_queue");
+        let workflow_id = string_field(caller, "workflowId", "workflow_id");
+        let tool_calls = match field(request, "toolCalls", "tool_calls") {
             None | Some(Value::Null) => &[][..],
-            Some(Value::Array(commands)) => commands.as_slice(),
-            Some(_) => bail!("commands must be an array"),
+            Some(Value::Array(calls)) => calls.as_slice(),
+            Some(_) => bail!("toolCalls must be an array"),
         };
 
         let principal = uid("Worker", &subject)?;
@@ -93,20 +86,10 @@ impl PolicyEngine {
             [
                 Entity::new(
                     principal.clone(),
-                    HashMap::from([
-                        (
-                            "namespace".to_owned(),
-                            RestrictedExpression::new_string(namespace.clone()),
-                        ),
-                        (
-                            "taskQueues".to_owned(),
-                            RestrictedExpression::new_set(
-                                task_queues
-                                    .into_iter()
-                                    .map(RestrictedExpression::new_string),
-                            ),
-                        ),
-                    ]),
+                    HashMap::from([(
+                        "namespace".to_owned(),
+                        RestrictedExpression::new_string(namespace.clone()),
+                    )]),
                     HashSet::new(),
                 )?,
                 Entity::new(
@@ -127,32 +110,32 @@ impl PolicyEngine {
             None,
         )?;
 
-        for (i, command) in commands.iter().enumerate() {
-            let command = CommandFacts::extract(command).with_context(|| format!("command {i}"))?;
+        for (i, call) in tool_calls.iter().enumerate() {
+            let call = ToolCall::parse(call).with_context(|| format!("tool call {i}"))?;
             let request = Request::new(
                 principal.clone(),
-                uid("Action", &command.action)?,
+                uid("Action", &call.name)?,
                 resource.clone(),
-                command.context()?,
+                call.context(&workflow_id)?,
                 None,
             )?;
             let response = self
                 .authorizer
                 .is_authorized(&request, &self.policies, &entities);
             for error in response.diagnostics().errors() {
-                tracing::warn!(%error, action = %command.action, "Cedar evaluation error");
+                tracing::warn!(%error, tool = %call.name, "Cedar evaluation error");
             }
             if response.decision() == Decision::Deny {
                 return Ok(Verdict {
                     allowed: false,
-                    reason: self.deny_reason(&command.action, &response),
+                    reason: self.deny_reason(&call.name, &response),
                 });
             }
         }
         Ok(Verdict::allow())
     }
 
-    fn deny_reason(&self, action: &str, response: &cedar_policy::Response) -> String {
+    fn deny_reason(&self, tool: &str, response: &cedar_policy::Response) -> String {
         let policies: Vec<&str> = response
             .diagnostics()
             .reason()
@@ -163,85 +146,153 @@ impl PolicyEngine {
             })
             .collect();
         if policies.is_empty() {
-            format!("{action} not permitted by any Cedar policy")
+            format!("tool {tool} not permitted by any Cedar policy")
         } else {
-            format!("{action} denied by Cedar policy {}", policies.join(", "))
+            format!("tool {tool} denied by Cedar policy {}", policies.join(", "))
         }
     }
 }
 
-/// The parts of a command the policies can see.
-#[derive(Debug, Default)]
-struct CommandFacts {
-    action: String,
-    target_task_queue: String,
-    target_namespace: String,
-    activity_type: String,
-    workflow_type: String,
+/// A tool call as the policies see it.
+#[derive(Debug)]
+struct ToolCall {
+    name: String,
+    parameters: Vec<Parameter>,
 }
 
-impl CommandFacts {
-    fn extract(command: &Value) -> anyhow::Result<Self> {
-        let Some(command) = command.as_object() else {
-            bail!("command must be an object");
-        };
+/// One parameter: its protobuf type and its data as a Cedar record.
+#[derive(Debug)]
+struct Parameter {
+    type_name: String,
+    data: Vec<(String, RestrictedExpression)>,
+}
 
-        // The attributes oneof determines the command, like in the proxy's
-        // built-in policy; commandType is only a fallback.
-        let attributes = command.iter().find_map(|(key, value)| {
-            let name = key
-                .strip_suffix("CommandAttributes")
-                .or_else(|| key.strip_suffix("_command_attributes"))?;
-            Some((pascal_case(name), value))
-        });
-        let Some((action, attributes)) = attributes.or_else(|| {
-            let command_type = command
-                .get("commandType")
-                .or_else(|| command.get("command_type"))?
-                .as_str()?;
-            let name = command_type
-                .strip_prefix("COMMAND_TYPE_")
-                .unwrap_or(command_type);
-            Some((pascal_case(&name.to_ascii_lowercase()), &Value::Null))
-        }) else {
-            bail!("command has neither attributes nor a commandType");
+impl ToolCall {
+    fn parse(call: &Value) -> anyhow::Result<Self> {
+        let name = string_field(call, "name", "name");
+        if name.is_empty() {
+            bail!("tool call has no name");
+        }
+        let parameters = match call.get("parameters") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(params)) => params
+                .iter()
+                .enumerate()
+                .map(|(i, p)| Parameter::parse(p).with_context(|| format!("parameter {i}")))
+                .collect::<anyhow::Result<_>>()?,
+            Some(_) => bail!("parameters must be an array"),
         };
-
-        let nested_name = |camel: &str, snake: &str| {
-            field(attributes, camel, snake)
-                .and_then(|v| v.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned()
-        };
-        Ok(Self {
-            target_task_queue: nested_name("taskQueue", "task_queue"),
-            target_namespace: string_field(attributes, "namespace", "namespace"),
-            activity_type: nested_name("activityType", "activity_type"),
-            workflow_type: nested_name("workflowType", "workflow_type"),
-            action,
-        })
+        Ok(Self { name, parameters })
     }
 
-    fn context(&self) -> anyhow::Result<Context> {
+    fn context(&self, workflow_id: &str) -> anyhow::Result<Context> {
+        let mut parameters = Vec::with_capacity(self.parameters.len());
+        for (i, param) in self.parameters.iter().enumerate() {
+            let record = RestrictedExpression::new_record([
+                (
+                    "type".to_owned(),
+                    RestrictedExpression::new_string(param.type_name.clone()),
+                ),
+                (
+                    "data".to_owned(),
+                    RestrictedExpression::new_record(param.data.clone())?,
+                ),
+            ])?;
+            parameters.push((format!("arg{i}"), record));
+        }
         Ok(Context::from_pairs([
             (
-                "targetTaskQueue".to_owned(),
-                RestrictedExpression::new_string(self.target_task_queue.clone()),
+                "workflowId".to_owned(),
+                RestrictedExpression::new_string(workflow_id.to_owned()),
             ),
             (
-                "targetNamespace".to_owned(),
-                RestrictedExpression::new_string(self.target_namespace.clone()),
+                "parameterCount".to_owned(),
+                RestrictedExpression::new_long(self.parameters.len() as i64),
             ),
             (
-                "activityType".to_owned(),
-                RestrictedExpression::new_string(self.activity_type.clone()),
-            ),
-            (
-                "workflowType".to_owned(),
-                RestrictedExpression::new_string(self.workflow_type.clone()),
+                "parameters".to_owned(),
+                RestrictedExpression::new_record(parameters)?,
             ),
         ])?)
+    }
+}
+
+/// Well-known types whose protobuf JSON form is not a plain object of fields;
+/// inside an Any they appear under a "value" key.
+const VALUE_FORM_TYPES: &[&str] = &[
+    "google.protobuf.Any",
+    "google.protobuf.Struct",
+    "google.protobuf.Value",
+    "google.protobuf.ListValue",
+    "google.protobuf.Timestamp",
+    "google.protobuf.Duration",
+    "google.protobuf.FieldMask",
+    "google.protobuf.DoubleValue",
+    "google.protobuf.FloatValue",
+    "google.protobuf.Int64Value",
+    "google.protobuf.UInt64Value",
+    "google.protobuf.Int32Value",
+    "google.protobuf.UInt32Value",
+    "google.protobuf.BoolValue",
+    "google.protobuf.StringValue",
+    "google.protobuf.BytesValue",
+];
+
+/// The proxy packs payloads it can't interpret (e.g. encrypted ones) as-is.
+const OPAQUE_PAYLOAD_TYPE: &str = "temporal.api.common.v1.Payload";
+
+impl Parameter {
+    /// Interprets the protobuf JSON form of a google.protobuf.Any.
+    fn parse(any: &Value) -> anyhow::Result<Self> {
+        let Some(object) = any.as_object() else {
+            bail!("parameter must be a JSON object (a google.protobuf.Any)");
+        };
+        let type_url = object
+            .get("@type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("parameter has no \"@type\""))?;
+        let type_name = type_url.rsplit('/').next().unwrap_or(type_url).to_owned();
+
+        let data = if type_name == OPAQUE_PAYLOAD_TYPE {
+            Vec::new()
+        } else if VALUE_FORM_TYPES.contains(&type_name.as_str()) {
+            match object.get("value") {
+                Some(Value::Object(fields)) => record_fields(fields),
+                Some(value) => to_cedar(value)
+                    .map(|v| vec![("value".to_owned(), v)])
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            }
+        } else {
+            let mut fields = object.clone();
+            fields.remove("@type");
+            record_fields(&fields)
+        };
+        Ok(Self { type_name, data })
+    }
+}
+
+/// Converts JSON object fields to Cedar record fields, dropping values Cedar
+/// can't represent.
+fn record_fields(fields: &Map<String, Value>) -> Vec<(String, RestrictedExpression)> {
+    fields
+        .iter()
+        .filter_map(|(k, v)| to_cedar(v).map(|v| (k.clone(), v)))
+        .collect()
+}
+
+/// Converts a JSON value to a Cedar value. Floats and nulls have no Cedar
+/// equivalent and are dropped (`None`); arrays become sets.
+fn to_cedar(value: &Value) -> Option<RestrictedExpression> {
+    match value {
+        Value::Null => None,
+        Value::Bool(b) => Some(RestrictedExpression::new_bool(*b)),
+        Value::Number(n) => n.as_i64().map(RestrictedExpression::new_long),
+        Value::String(s) => Some(RestrictedExpression::new_string(s.clone())),
+        Value::Array(items) => Some(RestrictedExpression::new_set(
+            items.iter().filter_map(to_cedar),
+        )),
+        Value::Object(fields) => RestrictedExpression::new_record(record_fields(fields)).ok(),
     }
 }
 
@@ -265,203 +316,252 @@ fn string_field(value: &Value, camel: &str, snake: &str) -> String {
         .to_owned()
 }
 
-/// Converts `scheduleActivityTask` or `schedule_activity_task` to
-/// `ScheduleActivityTask`.
-fn pascal_case(name: &str) -> String {
-    name.split('_')
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            chars
-                .next()
-                .map(|c| c.to_ascii_uppercase().to_string() + chars.as_str())
-                .unwrap_or_default()
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
-    const BUILTIN_POLICY: &str = include_str!("../policies/builtin.cedar");
+    const EXAMPLE_POLICY: &str = include_str!("../policies/example.cedar");
     const SCHEMA: &str = include_str!("../policies/schema.cedarschema");
 
     fn engine() -> PolicyEngine {
-        PolicyEngine::new(BUILTIN_POLICY, Some(SCHEMA))
-            .expect("builtin policy validates against schema")
+        PolicyEngine::new(EXAMPLE_POLICY, Some(SCHEMA))
+            .expect("example policy validates against schema")
     }
 
-    fn verify(commands: Value) -> Verdict {
-        engine()
-            .verify(&json!({
+    fn request(tool_calls: Value) -> Value {
+        json!({
+            "caller": {
                 "namespace": "ns-a",
-                "taskQueue": "queue-a",
-                "taskQueues": ["queue-a", "queue-b"],
                 "subject": "fleet-a",
-                "commands": commands,
-            }))
-            .expect("valid input")
+                "taskQueue": "queue-a",
+                "workflowId": "billing-42",
+            },
+            "toolCalls": tool_calls,
+        })
     }
 
-    fn assert_allowed(commands: Value) {
-        let verdict = verify(commands);
+    fn verify(tool_calls: Value) -> Verdict {
+        engine().verify(&request(tool_calls)).expect("valid input")
+    }
+
+    fn assert_allowed(tool_calls: Value) {
+        let verdict = verify(tool_calls);
         assert!(verdict.allowed, "expected allow, got {verdict:?}");
     }
 
-    fn assert_denied(commands: Value, policy: &str) {
-        let verdict = verify(commands);
+    fn assert_denied(tool_calls: Value, reason: &str) {
+        let verdict = verify(tool_calls);
         assert!(!verdict.allowed, "expected deny");
         assert!(
-            verdict.reason.contains(policy),
-            "reason {:?} should name policy {policy}",
+            verdict.reason.contains(reason),
+            "reason {:?} should contain {reason:?}",
             verdict.reason
         );
     }
 
-    fn schedule_activity(task_queue: &str) -> Value {
-        json!([{
-            "commandType": "COMMAND_TYPE_SCHEDULE_ACTIVITY_TASK",
-            "scheduleActivityTaskCommandAttributes": {
-                "activityId": "1",
-                "activityType": {"name": "Echo"},
-                "taskQueue": {"name": task_queue, "kind": "TASK_QUEUE_KIND_NORMAL"},
-                "retryPolicy": {"backoffCoefficient": 2.0}
-            }
-        }])
+    /// A google.protobuf.Value parameter, as the proxy renders json/plain input.
+    fn value_param(value: Value) -> Value {
+        json!({"@type": "type.googleapis.com/google.protobuf.Value", "value": value})
     }
 
-    fn start_child(namespace: Option<&str>, task_queue: &str) -> Value {
-        let mut attributes =
-            json!({"workflowType": {"name": "Child"}, "taskQueue": {"name": task_queue}});
-        if let Some(ns) = namespace {
-            attributes["namespace"] = json!(ns);
-        }
-        json!([{"startChildWorkflowExecutionCommandAttributes": attributes}])
+    fn call(name: &str, parameters: Vec<Value>) -> Value {
+        json!([{"name": name, "parameters": parameters}])
+    }
+
+    fn charge(amount: Value, currency: &str) -> Value {
+        call(
+            "payments/billing/Charge",
+            vec![value_param(json!({"amount": amount, "currency": currency}))],
+        )
     }
 
     #[test]
-    fn schedule_activity_task() {
-        assert_allowed(schedule_activity("queue-a"));
+    fn echo_is_allowed() {
+        assert_allowed(call("echo/echo/Echo", vec![value_param(json!("hi"))]));
+        assert_allowed(call("echo/echo/Echo", vec![]));
+    }
+
+    #[test]
+    fn charge_limits() {
+        assert_allowed(charge(json!(500), "USD"));
+        assert_allowed(charge(json!(1000), "EUR"));
+        assert_denied(charge(json!(5000), "USD"), "charge-limit-1000");
         assert_denied(
-            schedule_activity("queue-b"),
-            "activities-stay-on-token-queue",
+            charge(json!(500), "GBP"),
+            "tool payments/billing/Charge not permitted by any Cedar policy",
         );
-        assert_denied(schedule_activity(""), "activities-stay-on-token-queue");
+        // A float amount can't be represented in Cedar, so it's dropped, which
+        // the limit treats like a missing amount.
+        assert_denied(charge(json!(500.5), "USD"), "charge-limit-1000");
+        // No parameters at all: the limit forbids it (forbid wins over permit).
+        assert_denied(call("payments/billing/Charge", vec![]), "charge-limit-1000");
     }
 
     #[test]
-    fn start_child_workflow_execution() {
-        assert_allowed(start_child(Some("ns-a"), "queue-a"));
+    fn send_email_domain() {
+        let send = |to: &str| call("trusted-tools/SendEmail", vec![value_param(json!(to))]);
+        assert_allowed(send("a@example.com"));
+        assert_denied(send("a@evil.com"), "not permitted");
+    }
+
+    #[test]
+    fn undeclared_tool_is_denied() {
         assert_denied(
-            start_child(Some("ns-a"), "queue-b"),
-            "child-workflows-stay-on-token-queue-and-namespace",
-        );
-        assert_denied(
-            start_child(Some("ns-b"), "queue-a"),
-            "child-workflows-stay-on-token-queue-and-namespace",
-        );
-        // An unset namespace means "same as parent".
-        assert_allowed(start_child(None, "queue-a"));
-    }
-
-    #[test]
-    fn continue_as_new_workflow_execution() {
-        // An unset task queue means "same queue".
-        assert_allowed(json!([{"continueAsNewWorkflowExecutionCommandAttributes": {}}]));
-        assert_denied(
-            json!([{"continueAsNewWorkflowExecutionCommandAttributes": {"taskQueue": {"name": "queue-b"}}}]),
-            "continue-as-new-stays-on-token-queue",
+            call(
+                "forbidden-queue/EchoActivity",
+                vec![value_param(json!("x"))],
+            ),
+            "tool forbidden-queue/EchoActivity not permitted by any Cedar policy",
         );
     }
 
     #[test]
-    fn untargeted_commands_pass_through() {
-        assert_allowed(json!([
-            {"recordMarkerCommandAttributes": {"markerName": "m"}},
-            {"completeWorkflowExecutionCommandAttributes": {}},
-            {"commandType": "COMMAND_TYPE_START_TIMER"},
-        ]));
+    fn first_denied_call_denies_request() {
+        let mut calls = call("echo/echo/Echo", vec![]);
+        calls
+            .as_array_mut()
+            .unwrap()
+            .extend(charge(json!(5000), "USD").as_array().unwrap().clone());
+        assert_denied(calls, "charge-limit-1000");
     }
 
     #[test]
-    fn no_commands() {
+    fn no_tool_calls() {
         assert_allowed(json!([]));
         assert!(
             engine()
-                .verify(&json!({"namespace": "ns-a", "taskQueue": "queue-a"}))
+                .verify(&json!({"caller": {"taskQueue": "queue-a"}}))
                 .unwrap()
                 .allowed
         );
     }
 
     #[test]
-    fn first_violation_denies_whole_call() {
-        let mut commands = schedule_activity("queue-a");
-        commands
-            .as_array_mut()
-            .unwrap()
-            .extend(schedule_activity("queue-b").as_array().unwrap().clone());
-        assert_denied(commands, "activities-stay-on-token-queue");
+    fn parameter_mapping() {
+        let message = Parameter::parse(&json!({
+            "@type": "type.googleapis.com/acme.billing.v1.ChargeRequest",
+            "amount": 5,
+            "currency": "USD",
+            "ratio": 0.5,
+            "note": null,
+        }))
+        .unwrap();
+        assert_eq!(message.type_name, "acme.billing.v1.ChargeRequest");
+        let mut keys: Vec<_> = message.data.iter().map(|(k, _)| k.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, ["amount", "currency"]);
+
+        let opaque = Parameter::parse(&json!({
+            "@type": "type.googleapis.com/temporal.api.common.v1.Payload",
+            "metadata": {"encoding": "YmluYXJ5L2VuY3J5cHRlZA=="},
+            "data": "c2VjcmV0",
+        }))
+        .unwrap();
+        assert!(opaque.data.is_empty());
+
+        let scalar = Parameter::parse(&value_param(json!("hi"))).unwrap();
+        assert_eq!(scalar.type_name, "google.protobuf.Value");
+        assert_eq!(scalar.data.len(), 1);
+        assert_eq!(scalar.data[0].0, "value");
+
+        assert!(Parameter::parse(&json!({"no": "type"})).is_err());
+        assert!(Parameter::parse(&json!("not an any")).is_err());
+    }
+
+    #[test]
+    fn multiple_parameters_and_context_fields() {
+        let policies = format!(
+            "{EXAMPLE_POLICY}\n{}",
+            r#"@id("two-args-from-billing-workflows")
+            permit (principal, action == Action::"echo/echo/Echo", resource)
+            when {
+              context.workflowId like "billing-*" &&
+              context.parameterCount == 2 &&
+              context.parameters has arg1 &&
+              context.parameters.arg1.type == "acme.v1.Note"
+            };"#
+        );
+        // No schema: the extra policy uses fields the example schema doesn't
+        // declare for echo.
+        let engine = PolicyEngine::new(&policies, None).unwrap();
+        let req = request(call(
+            "echo/echo/Echo",
+            vec![
+                value_param(json!("hi")),
+                json!({"@type": "type.googleapis.com/acme.v1.Note", "text": "x"}),
+            ],
+        ));
+        assert!(engine.verify(&req).unwrap().allowed);
+    }
+
+    #[test]
+    fn workflow_id_condition() {
+        let policies = r#"
+            @id("billing-workflows-only")
+            permit (principal, action == Action::"echo/echo/Echo", resource)
+            when { context.workflowId like "billing-*" };
+        "#;
+        let engine = PolicyEngine::new(policies, Some(SCHEMA)).unwrap();
+        assert!(
+            engine
+                .verify(&request(call("echo/echo/Echo", vec![])))
+                .unwrap()
+                .allowed
+        );
+        let mut other = request(call("echo/echo/Echo", vec![]));
+        other["caller"]["workflowId"] = json!("marketing-1");
+        assert!(!engine.verify(&other).unwrap().allowed);
     }
 
     #[test]
     fn accepts_proto_field_names() {
         let verdict = engine()
             .verify(&json!({
-                "namespace": "ns-a",
-                "task_queue": "queue-a",
-                "commands": [{"schedule_activity_task_command_attributes": {"task_queue": {"name": "queue-b"}}}],
+                "caller": {"task_queue": "queue-a", "workflow_id": "wf"},
+                "tool_calls": [{"name": "echo/echo/Echo"}],
             }))
             .unwrap();
-        assert!(!verdict.allowed);
+        assert!(verdict.allowed);
     }
 
     #[test]
-    fn default_deny_without_permit() {
-        let engine = PolicyEngine::new("", None).unwrap();
-        let verdict = engine
-            .verify(&json!({"namespace": "ns-a", "taskQueue": "queue-a", "commands": [{"commandType": "COMMAND_TYPE_START_TIMER"}]}))
-            .unwrap();
-        assert_eq!(
-            verdict,
-            Verdict {
-                allowed: false,
-                reason: "StartTimer not permitted by any Cedar policy".to_owned()
-            }
+    fn readme_declaring_a_tool_example() {
+        // The "Declaring a tool" walkthrough from README.md.
+        let schema = format!(
+            "{SCHEMA}\n{}",
+            r#"type RefundArguments = { arg0?: { type: String, data: { orderId?: String, amount?: Long } } };
+            action "payments/billing/Refund" appliesTo {
+              principal: Worker,
+              resource: TaskQueue,
+              context: { workflowId: String, parameterCount: Long, parameters: RefundArguments },
+            };"#
         );
-    }
-
-    #[test]
-    fn activity_type_allowlist_example() {
-        // The extension example from README.md, layered on the built-in policy.
         let policies = format!(
-            "{BUILTIN_POLICY}\n{}",
-            r#"@id("allowed-activity-types")
-            forbid (principal, action == Action::"ScheduleActivityTask", resource)
-            unless { ["Echo", "SendEmail"].contains(context.activityType) };"#
+            "{EXAMPLE_POLICY}\n{}",
+            r#"@id("refunds-from-order-workflows")
+            permit (principal, action == Action::"payments/billing/Refund", resource)
+            when {
+              context.workflowId like "order-*" &&
+              context.parameters has arg0 && context.parameters.arg0.data has amount &&
+              context.parameters.arg0.data.amount <= 100
+            };"#
         );
-        let engine = PolicyEngine::new(&policies, Some(SCHEMA)).expect("example validates");
-        let request = |activity_type: &str| {
-            json!({
-                "namespace": "ns-a",
-                "taskQueue": "queue-a",
-                "commands": [{"scheduleActivityTaskCommandAttributes": {
-                    "activityType": {"name": activity_type},
-                    "taskQueue": {"name": "queue-a"},
-                }}],
-            })
-        };
-        assert!(engine.verify(&request("Echo")).unwrap().allowed);
-        let verdict = engine.verify(&request("DropTables")).unwrap();
-        assert!(!verdict.allowed && verdict.reason.contains("allowed-activity-types"));
+        let engine = PolicyEngine::new(&policies, Some(&schema)).expect("README example validates");
+        let mut req = request(call(
+            "payments/billing/Refund",
+            vec![value_param(json!({"orderId": "o-1", "amount": 50}))],
+        ));
+        req["caller"]["workflowId"] = json!("order-7");
+        assert!(engine.verify(&req).unwrap().allowed);
+        req["caller"]["workflowId"] = json!("billing-7");
+        assert!(!engine.verify(&req).unwrap().allowed);
     }
 
     #[test]
     fn invalid_policy_is_rejected_by_schema() {
         let err = PolicyEngine::new(
-            r#"permit (principal, action, resource) when { context.nope == "" };"#,
+            r#"permit (principal, action == Action::"echo/echo/Echo", resource) when { context.nope == "" };"#,
             Some(SCHEMA),
         );
         assert!(err.is_err());
@@ -469,8 +569,17 @@ mod tests {
 
     #[test]
     fn malformed_input() {
-        assert!(engine().verify(&json!({"commands": "nope"})).is_err());
-        assert!(engine().verify(&json!({"commands": [42]})).is_err());
-        assert!(engine().verify(&json!({"commands": [{"foo": 1}]})).is_err());
+        assert!(engine().verify(&json!({"toolCalls": "nope"})).is_err());
+        assert!(engine().verify(&json!({"toolCalls": [42]})).is_err());
+        assert!(
+            engine()
+                .verify(&json!({"toolCalls": [{"parameters": []}]}))
+                .is_err()
+        );
+        assert!(
+            engine()
+                .verify(&json!({"toolCalls": [{"name": "x", "parameters": [{"no": "type"}]}]}))
+                .is_err()
+        );
     }
 }

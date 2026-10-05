@@ -53,11 +53,13 @@ before any request is forwarded. For each incoming call it:
      returning to the worker.
    - `RecordWorkerHeartbeat` must target the identity's namespace, and every reported heartbeat entry
      must target one of the identity's task queues.
-   - `RespondWorkflowTaskCompleted` additionally has its emitted **commands** verified
-     (`internal/commandpolicy`). By default the built-in policy ensures a workflow cannot schedule
-     activities / child workflows / continue-as-new outside the task queue that issued the workflow
-     task token or outside the identity's namespace. This decision can be delegated to your own
-     Temporal Nexus service instead — see [Custom command verification](#custom-command-verification).
+   - `RespondWorkflowTaskCompleted` additionally has its emitted **commands** checked. Child
+     workflows and continue-as-new must stay on the task queue that issued the workflow task token
+     (and in the identity's namespace); activities on that queue are allowed. Work that leaves the
+     queue (Nexus operations, and activities on other task queues) is translated into **tool calls**
+     and judged by a tool verifier (`internal/toolpolicy`). By default, cross-queue activities are
+     denied and Nexus operations are allowed; the decision can be delegated to your own Temporal Nexus
+     service instead. See [Tool-call verification](#tool-call-verification).
 
 4. **Logs billable actions.** On success, the proxy emits a `cloud action consumed` log line per
    billable [Temporal Cloud action](https://docs.temporal.io/cloud/actions) it can observe in worker
@@ -152,80 +154,114 @@ All configuration is via environment variables (`internal/config/config.go`).
 | `TEMPORAL_PROXY_VALKEY_WRITE_TIMEOUT` | `2s` | Valkey write operation timeout. |
 | `TEMPORAL_PROXY_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error`. Action logs are at `info`. |
 
-### Command verification
+### Tool-call verification
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TEMPORAL_PROXY_COMMAND_VERIFIER` | `builtin` | `builtin` or `nexus`. See [Custom command verification](#custom-command-verification). |
-| `TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_NAMESPACE` | — | Required in `nexus` mode. Caller namespace the verification operation runs in; the endpoint must allow it. |
-| `TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_ENDPOINT` | — | Required in `nexus` mode. Nexus endpoint name. |
-| `TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_SERVICE` | — | Required in `nexus` mode. Nexus service name. |
-| `TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_OPERATION` | `VerifyCommands` | Nexus operation name. |
-| `TEMPORAL_PROXY_COMMAND_VERIFIER_TIMEOUT` | `5s` | Maximum time to wait for a verdict per `RespondWorkflowTaskCompleted`. |
+| `TEMPORAL_PROXY_TOOL_VERIFIER` | `none` | `none` or `nexus`. See [Tool-call verification](#tool-call-verification). |
+| `TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_NAMESPACE` | — | Required in `nexus` mode. Caller namespace the verification operation runs in; the endpoint must allow it. |
+| `TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_ENDPOINT` | — | Required in `nexus` mode. Nexus endpoint name. |
+| `TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_SERVICE` | — | Required in `nexus` mode. Nexus service name. |
+| `TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_OPERATION` | `VerifyToolCalls` | Nexus operation name. |
+| `TEMPORAL_PROXY_TOOL_VERIFIER_TIMEOUT` | `5s` | Maximum time to wait for a verdict per `RespondWorkflowTaskCompleted`. |
 
 ---
 
-## Custom command verification
+## Tool-call verification
 
-With `TEMPORAL_PROXY_COMMAND_VERIFIER=nexus`, the proxy stops applying its built-in command policy.
-Instead, for every `RespondWorkflowTaskCompleted` it asks a Temporal Nexus service you operate
-whether the emitted commands may be forwarded. Token, namespace and task-queue scoping of the call
-itself still happen before the verifier runs.
+The proxy enforces the rules that keep a workflow on its own task queue itself:
+- activities on the queue that issued the workflow task token are allowed;
+- child workflows must run on that queue, in the identity's namespace;
+- continue-as-new must stay on that queue.
 
-The proxy invokes the operation as a **standalone Nexus operation** (`StartNexusOperationExecution`,
-then `PollNexusOperationExecution` until it closes) over its upstream connection, using the upstream
-credentials. The Temporal server must support standalone Nexus operations and have them enabled. On a
-self-hosted server or the dev server, that's the `nexusoperation.enableStandalone` dynamic config
-(for example `temporal server start-dev --dynamic-config-value nexusoperation.enableStandalone=true`).
+Work that leaves the queue is where untrusted workflows reach trusted systems, so it becomes a
+**tool call** that a tool verifier judges:
 
-The contract is defined in protobuf, in
-[`proto/commandpolicy/v1/commandpolicy.proto`](proto/commandpolicy/v1/commandpolicy.proto). Go code
-generated from it lives in `gen/commandpolicy/v1`; run `make generate` after changing the proto.
+| Command | Tool name | Parameters |
+|---------|-----------|------------|
+| `ScheduleNexusOperation` | `<endpoint>/<service>/<operation>` | the operation input (zero or one) |
+| `ScheduleActivityTask` on another task queue | `<taskQueue>/<activityType>` | one per input argument |
 
-**Input**: `VerifyCommandsRequest`, sent as a `json/protobuf` payload. This is what the Temporal
-SDKs' protobuf payload converters read, so a handler typed on the generated message gets it decoded
-directly. Handlers without generated types can parse it as plain JSON in the protobuf JSON mapping:
+With `TEMPORAL_PROXY_TOOL_VERIFIER=none` (the default), cross-queue activities are denied and Nexus
+operations are allowed. This is how the proxy behaved before tool calls existed.
+
+With `TEMPORAL_PROXY_TOOL_VERIFIER=nexus`, the proxy asks a Temporal Nexus service you operate.
+Each `RespondWorkflowTaskCompleted` that makes tool calls costs one verification round trip; calls
+without tool calls skip it. The proxy invokes the operation as a **standalone Nexus operation**
+(`StartNexusOperationExecution`, then `PollNexusOperationExecution` until it closes) over its upstream
+connection, using the upstream credentials. The Temporal server must support standalone Nexus
+operations and have them enabled. On a self-hosted server or the dev server, that's the
+`nexusoperation.enableStandalone` dynamic config (for example
+`temporal server start-dev --dynamic-config-value nexusoperation.enableStandalone=true`).
+
+The contract is defined in
+[`proto/toolpolicy/v1/toolpolicy.proto`](proto/toolpolicy/v1/toolpolicy.proto). Go code generated
+from it lives in `gen/toolpolicy/v1`; run `make generate` after changing the proto.
+
+**Input**: `VerifyToolCallsRequest`, sent as a `json/protobuf` payload:
 
 ```json
 {
-  "namespace": "default",
-  "taskQueue": "my-queue",
-  "taskQueues": ["my-queue", "my-other-queue"],
-  "subject": "fleet-a",
-  "commands": [ { "commandType": "COMMAND_TYPE_SCHEDULE_ACTIVITY_TASK", "scheduleActivityTaskCommandAttributes": { "...": "..." } } ]
+  "caller": {
+    "namespace": "default",
+    "subject": "fleet-a",
+    "taskQueue": "my-queue",
+    "workflowId": "order-1234"
+  },
+  "toolCalls": [
+    {
+      "name": "payments/billing/Charge",
+      "parameters": [
+        { "@type": "type.googleapis.com/google.protobuf.Value", "value": { "amount": 500, "currency": "USD" } }
+      ]
+    }
+  ]
 }
 ```
 
-- `taskQueue` is the queue that issued the workflow task token. `taskQueues` lists every queue the
-  identity is authorized for.
-- `commands` are `temporal.api.command.v1.Command` messages.
+- `caller` identifies the workflow making the calls. `taskQueue` is the queue that issued its
+  workflow task token. The proxy records the workflow ID when it hands that token out.
+- Each parameter is a `google.protobuf.Any`, typed where possible:
 
-**Output**: `VerifyCommandsResponse` (`allowed`, `reason`), as a `json/protobuf` or `binary/protobuf`
-payload. Plain JSON such as `{"allowed": true}` also works.
+| Input payload encoding | Parameter |
+|------------------------|-----------|
+| `json/protobuf` with `messageType` | an Any of that message type (its JSON fields under `"@type"`) |
+| `binary/protobuf` of a Temporal API or well-known type | an Any of that type |
+| `binary/protobuf` of any other type | **the workflow task is rejected**: the proxy can't render it for verification. Send such inputs as `json/protobuf`. |
+| `json/plain` | `google.protobuf.Value` |
+| `binary/plain` | `google.protobuf.BytesValue` |
+| `binary/null` | a null `google.protobuf.Value` |
+| anything else (for example encrypted payloads) | the packed `temporal.api.common.v1.Payload`, which is opaque but still lets policies decide by tool name |
+
+  A verifier decoding the request with a protobuf JSON decoder must be able to resolve the
+  parameter types it receives. Alternatively, it can treat parameters as plain JSON.
+
+**Output**: `VerifyToolCallsResponse` (`allowed`, `reason`), as a `json/protobuf` or
+`binary/protobuf` payload. Plain JSON such as `{"allowed": true}` also works.
 
 - `allowed: false`, or an empty response, rejects the worker's call with `PermissionDenied` and the
   reason.
 - The proxy **fails closed**. A failed operation, a malformed result, or no result within
-  `TEMPORAL_PROXY_COMMAND_VERIFIER_TIMEOUT` rejects the call with `Unavailable`, and the worker retries.
+  `TEMPORAL_PROXY_TOOL_VERIFIER_TIMEOUT` rejects the call with `Unavailable`, and the worker retries.
 
-`cmd/example-verifier` is a reference handler. It hosts the operation in a Go worker and applies the
-built-in policy, so you can use it as a starting point for your own rules:
+`cmd/example-verifier` is a reference handler in Go. It allows the tool names listed in
+`VERIFIER_ALLOWED_TOOLS`:
 
 ```bash
-temporal operator nexus endpoint create --name command-verifier \
-  --target-namespace default --target-task-queue command-verifier
-go run ./cmd/example-verifier   # TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE, TEMPORAL_API_KEY, VERIFIER_TASK_QUEUE, VERIFIER_SERVICE
-TEMPORAL_PROXY_COMMAND_VERIFIER=nexus \
-TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_NAMESPACE=default \
-TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_ENDPOINT=command-verifier \
-TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_SERVICE=command-policy \
+temporal operator nexus endpoint create --name tool-verifier \
+  --target-namespace default --target-task-queue tool-verifier
+VERIFIER_ALLOWED_TOOLS=echo/echo/Echo go run ./cmd/example-verifier   # also TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE, TEMPORAL_API_KEY, VERIFIER_TASK_QUEUE, VERIFIER_SERVICE
+TEMPORAL_PROXY_TOOL_VERIFIER=nexus \
+TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_NAMESPACE=default \
+TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_ENDPOINT=tool-verifier \
+TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_SERVICE=tool-policy \
   go run ./cmd/temporal-proxy
 ```
 
-[`verifiers/cedar`](verifiers/cedar) is a policy-driven alternative written in Rust. Its rules are
-[Cedar](https://www.cedarpolicy.com) policies, so you can change them without writing code. Its
-`policies/builtin.cedar` reproduces the built-in policy, and it uses the same endpoint and
-environment variables as `cmd/example-verifier`.
+[`verifiers/cedar`](verifiers/cedar) is a policy-driven alternative written in Rust. Each tool is a
+[Cedar](https://www.cedarpolicy.com) action with typed parameters, so rules like "charges up to 1000,
+in USD or EUR" are policies rather than code. It uses the same endpoint and environment variables as
+`cmd/example-verifier`.
 
 Run the verifier on trusted infrastructure, never behind the proxy itself: it decides what
 untrusted workers may do.

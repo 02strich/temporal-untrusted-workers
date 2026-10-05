@@ -1,9 +1,10 @@
-package commandpolicy
+package toolpolicy
 
 import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -15,33 +16,25 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	commandpolicypb "github.com/02strich/temporal-untrusted-workers/gen/commandpolicy/v1"
+	toolpolicypb "github.com/02strich/temporal-untrusted-workers/gen/toolpolicy/v1"
 )
 
 // DefaultNexusOperation is the operation name NexusVerifier calls when none
 // is configured.
-const DefaultNexusOperation = "VerifyCommands"
+const DefaultNexusOperation = "VerifyToolCalls"
 
-// Payload encodings and metadata keys, matching the Temporal SDKs' protobuf
-// payload converters.
-const (
-	metadataEncoding    = "encoding"
-	metadataMessageType = "messageType"
-	encodingJSONProto   = "json/protobuf"
-	encodingBinaryProto = "binary/protobuf"
-)
-
-// NexusVerifier delegates command verification to a Temporal Nexus service,
+// NexusVerifier delegates tool-call verification to a Temporal Nexus service,
 // invoked as a standalone Nexus operation (StartNexusOperationExecution +
 // PollNexusOperationExecution) through Client - normally the proxy's
 // upstream connection, so the upstream credentials are reused.
 //
-// The operation receives a commandpolicypb.VerifyCommandsRequest as a
+// The operation receives a toolpolicypb.VerifyToolCallsRequest as a
 // "json/protobuf" payload and must complete (synchronously, or
-// asynchronously within Timeout) with a commandpolicypb.VerifyCommandsResponse
+// asynchronously within Timeout) with a toolpolicypb.VerifyToolCallsResponse
 // payload. allowed=false denies the call with the given reason. A failed
 // operation, a malformed result, or no result within Timeout makes the proxy
-// fail closed with Unavailable.
+// fail closed with Unavailable. A tool call whose parameters could not be
+// rendered (Call.Err) is denied without contacting the verifier.
 type NexusVerifier struct {
 	Client workflowservice.WorkflowServiceClient
 	// Namespace is the caller namespace the standalone operation runs in;
@@ -54,6 +47,12 @@ type NexusVerifier struct {
 }
 
 func (v *NexusVerifier) Verify(ctx context.Context, req Request) error {
+	for _, call := range req.Calls {
+		if call.Err != nil {
+			return DeniedError{Reason: call.Err.Error()}
+		}
+	}
+
 	input, err := encodeVerifyRequest(req)
 	if err != nil {
 		return UnavailableError{Err: err}
@@ -111,22 +110,47 @@ func (v *NexusVerifier) Verify(ctx context.Context, req Request) error {
 	}
 }
 
+// The request is built as JSON directly rather than through
+// toolpolicypb.VerifyToolCallsRequest, because the parameters are protobuf
+// JSON Anys of types the proxy usually does not link in (see payloadParameter).
+// The field names mirror the protobuf JSON mapping of toolpolicy.proto.
+type wireRequest struct {
+	Caller    wireCaller     `json:"caller"`
+	ToolCalls []wireToolCall `json:"toolCalls,omitempty"`
+}
+
+type wireCaller struct {
+	Namespace  string `json:"namespace,omitempty"`
+	Subject    string `json:"subject,omitempty"`
+	TaskQueue  string `json:"taskQueue,omitempty"`
+	WorkflowID string `json:"workflowId,omitempty"`
+}
+
+type wireToolCall struct {
+	Name       string            `json:"name,omitempty"`
+	Parameters []json.RawMessage `json:"parameters,omitempty"`
+}
+
 func encodeVerifyRequest(req Request) (*commonpb.Payload, error) {
-	msg := &commandpolicypb.VerifyCommandsRequest{
-		Namespace:  req.Identity.Namespace,
-		TaskQueue:  req.TaskQueue,
-		TaskQueues: req.Identity.TaskQueues,
-		Subject:    req.Identity.Subject,
-		Commands:   req.Commands,
+	wire := wireRequest{
+		Caller: wireCaller{
+			Namespace:  req.Identity.Namespace,
+			Subject:    req.Identity.Subject,
+			TaskQueue:  req.TaskQueue,
+			WorkflowID: req.WorkflowID,
+		},
 	}
-	data, err := protojson.Marshal(msg)
+	for _, call := range req.Calls {
+		wire.ToolCalls = append(wire.ToolCalls, wireToolCall{Name: call.Name, Parameters: call.Parameters})
+	}
+	data, err := json.Marshal(wire)
 	if err != nil {
 		return nil, fmt.Errorf("encoding verifier request: %w", err)
 	}
 	return &commonpb.Payload{
 		Metadata: map[string][]byte{
 			metadataEncoding:    []byte(encodingJSONProto),
-			metadataMessageType: []byte(msg.ProtoReflect().Descriptor().FullName()),
+			metadataMessageType: []byte((&toolpolicypb.VerifyToolCallsRequest{}).ProtoReflect().Descriptor().FullName()),
 		},
 		Data: data,
 	}, nil
@@ -136,7 +160,7 @@ func decodeVerifyResponse(result *commonpb.Payload) error {
 	if result == nil {
 		return UnavailableError{Err: errors.New("nexus operation returned no result")}
 	}
-	var out commandpolicypb.VerifyCommandsResponse
+	var out toolpolicypb.VerifyToolCallsResponse
 	var err error
 	if string(result.GetMetadata()[metadataEncoding]) == encodingBinaryProto {
 		err = proto.Unmarshal(result.GetData(), &out)
@@ -153,7 +177,7 @@ func decodeVerifyResponse(result *commonpb.Payload) error {
 	if !out.GetAllowed() {
 		reason := out.GetReason()
 		if reason == "" {
-			reason = "commands rejected by command verifier"
+			reason = "tool calls rejected by tool verifier"
 		}
 		return DeniedError{Reason: reason}
 	}

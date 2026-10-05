@@ -18,6 +18,8 @@ const numShards = 32
 type Entry struct {
 	Namespace string
 	TaskQueue string
+	// WorkflowID is the workflow the task belongs to; empty for Nexus tasks.
+	WorkflowID string
 }
 
 // Store records which identity each issued Temporal task token belongs to.

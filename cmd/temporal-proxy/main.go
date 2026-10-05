@@ -21,10 +21,10 @@ import (
 	"google.golang.org/grpc/credentials"
 
 	"github.com/02strich/temporal-untrusted-workers/internal/auth"
-	"github.com/02strich/temporal-untrusted-workers/internal/commandpolicy"
 	"github.com/02strich/temporal-untrusted-workers/internal/config"
 	"github.com/02strich/temporal-untrusted-workers/internal/proxy"
 	"github.com/02strich/temporal-untrusted-workers/internal/tokencache"
+	"github.com/02strich/temporal-untrusted-workers/internal/toolpolicy"
 	"github.com/02strich/temporal-untrusted-workers/internal/upstream"
 )
 
@@ -69,7 +69,7 @@ func run() error {
 		}
 	}()
 
-	verifier := buildCommandVerifier(cfg.CommandVerifier, upstreamClient)
+	verifier := buildToolVerifier(cfg.ToolVerifier, upstreamClient)
 
 	serverOpts := []grpc.ServerOption{grpc.UnaryInterceptor(proxy.NewInterceptor(authenticator, cache, verifier))}
 	if cfg.Downstream.TLSMode == config.TLSModeTLS {
@@ -93,7 +93,7 @@ func run() error {
 
 	serveErr := make(chan error, 1)
 	go func() {
-		slog.Info("temporal-proxy listening", "addr", cfg.Downstream.ListenAddr, "upstream", cfg.Upstream.Addr, "token_cache_backend", cfg.TokenCacheBackend, "command_verifier", cfg.CommandVerifier.Mode)
+		slog.Info("temporal-proxy listening", "addr", cfg.Downstream.ListenAddr, "upstream", cfg.Upstream.Addr, "token_cache_backend", cfg.TokenCacheBackend, "tool_verifier", cfg.ToolVerifier.Mode)
 		serveErr <- grpcServer.Serve(listener)
 	}()
 
@@ -139,14 +139,14 @@ func buildTokenCache(ctx context.Context, cfg config.Config) (tokencache.Store, 
 	}
 }
 
-// buildCommandVerifier returns the configured commandpolicy.Verifier. The
-// Nexus verifier runs its standalone Nexus operations over the upstream
-// connection, so it reuses the proxy's upstream credentials.
-func buildCommandVerifier(cfg config.CommandVerifierConfig, upstreamClient workflowservice.WorkflowServiceClient) commandpolicy.Verifier {
-	if cfg.Mode != config.CommandVerifierNexus {
-		return commandpolicy.BuiltIn{}
+// buildToolVerifier returns the configured toolpolicy.Verifier. The Nexus
+// verifier runs its standalone Nexus operations over the upstream connection,
+// so it reuses the proxy's upstream credentials.
+func buildToolVerifier(cfg config.ToolVerifierConfig, upstreamClient workflowservice.WorkflowServiceClient) toolpolicy.Verifier {
+	if cfg.Mode != config.ToolVerifierNexus {
+		return toolpolicy.Default{}
 	}
-	return &commandpolicy.NexusVerifier{
+	return &toolpolicy.NexusVerifier{
 		Client:    upstreamClient,
 		Namespace: cfg.NexusNamespace,
 		Endpoint:  cfg.NexusEndpoint,

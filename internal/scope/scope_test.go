@@ -3,6 +3,8 @@ package scope
 import (
 	"testing"
 
+	commandpb "go.temporal.io/api/command/v1"
+	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	workerpb "go.temporal.io/api/worker/v1"
@@ -205,16 +207,17 @@ type proxyReq struct {
 
 func TestCollectResponseTaskTokens_Poll(t *testing.T) {
 	tok := []byte("poll-tok")
+	exec := &commonpb.WorkflowExecution{WorkflowId: "wf-1", RunId: "run-1"}
 
-	if got := CollectResponseTaskTokens(&workflowservice.PollWorkflowTaskQueueResponse{TaskToken: tok}); len(got) != 1 || string(got[0]) != string(tok) {
-		t.Fatalf("unexpected tokens: %v", got)
+	check := func(name string, got []IssuedToken, wantWorkflowID string) {
+		t.Helper()
+		if len(got) != 1 || string(got[0].Token) != string(tok) || got[0].WorkflowID != wantWorkflowID {
+			t.Fatalf("%s: unexpected tokens: %+v", name, got)
+		}
 	}
-	if got := CollectResponseTaskTokens(&workflowservice.PollActivityTaskQueueResponse{TaskToken: tok}); len(got) != 1 || string(got[0]) != string(tok) {
-		t.Fatalf("unexpected tokens: %v", got)
-	}
-	if got := CollectResponseTaskTokens(&workflowservice.PollNexusTaskQueueResponse{TaskToken: tok}); len(got) != 1 || string(got[0]) != string(tok) {
-		t.Fatalf("unexpected tokens: %v", got)
-	}
+	check("workflow poll", CollectResponseTaskTokens(&workflowservice.PollWorkflowTaskQueueResponse{TaskToken: tok, WorkflowExecution: exec}), "wf-1")
+	check("activity poll", CollectResponseTaskTokens(&workflowservice.PollActivityTaskQueueResponse{TaskToken: tok, WorkflowExecution: exec}), "wf-1")
+	check("nexus poll", CollectResponseTaskTokens(&workflowservice.PollNexusTaskQueueResponse{TaskToken: tok}), "")
 
 	// An empty poll response (no task available - the common long-poll
 	// timeout case) must not yield a token.
@@ -227,31 +230,24 @@ func TestCollectResponseTaskTokens_Poll(t *testing.T) {
 }
 
 func TestCollectResponseTaskTokens_EagerDispatch(t *testing.T) {
-	tokA := []byte("workflow-task-tok")
-	tokB := []byte("activity-task-tok-1")
-	tokC := []byte("activity-task-tok-2")
-
+	exec := &commonpb.WorkflowExecution{WorkflowId: "wf-1"}
 	resp := &workflowservice.RespondWorkflowTaskCompletedResponse{
-		WorkflowTask: &workflowservice.PollWorkflowTaskQueueResponse{TaskToken: tokA},
+		WorkflowTask: &workflowservice.PollWorkflowTaskQueueResponse{TaskToken: []byte("workflow-task-tok"), WorkflowExecution: exec},
 		ActivityTasks: []*workflowservice.PollActivityTaskQueueResponse{
-			{TaskToken: tokB},
-			{TaskToken: tokC},
+			{TaskToken: []byte("activity-task-tok-1"), WorkflowExecution: exec},
+			{TaskToken: []byte("activity-task-tok-2"), WorkflowExecution: exec},
 		},
 	}
 
 	got := CollectResponseTaskTokens(resp)
-	if len(got) != 3 {
-		t.Fatalf("expected 3 tokens, got %d: %v", len(got), got)
+	want := []string{"workflow-task-tok", "activity-task-tok-1", "activity-task-tok-2"}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d tokens, got %d: %+v", len(want), len(got), got)
 	}
-	want := map[string]bool{string(tokA): true, string(tokB): true, string(tokC): true}
-	for _, g := range got {
-		if !want[string(g)] {
-			t.Fatalf("unexpected token %v in result", g)
+	for i, g := range got {
+		if string(g.Token) != want[i] || g.WorkflowID != "wf-1" {
+			t.Fatalf("token %d: got %+v, want %s for wf-1", i, g, want[i])
 		}
-		delete(want, string(g))
-	}
-	if len(want) != 0 {
-		t.Fatalf("missing expected tokens: %v", want)
 	}
 }
 
@@ -261,5 +257,116 @@ func TestCollectResponseTaskTokens_NoEagerDispatch(t *testing.T) {
 	resp := &workflowservice.RespondWorkflowTaskCompletedResponse{}
 	if got := CollectResponseTaskTokens(resp); len(got) != 0 {
 		t.Fatalf("expected no tokens, got %v", got)
+	}
+}
+
+func TestValidateCommands_ActivitiesAreNotChecked(t *testing.T) {
+	// Activities on other queues are tool calls judged by package toolpolicy.
+	commands := []*commandpb.Command{
+		{
+			Attributes: &commandpb.Command_ScheduleActivityTaskCommandAttributes{
+				ScheduleActivityTaskCommandAttributes: &commandpb.ScheduleActivityTaskCommandAttributes{
+					TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-b"},
+				},
+			},
+		},
+	}
+	if err := ValidateCommands(commands, "ns-a", "queue-a"); err != nil {
+		t.Fatalf("expected cross-queue activity to be left to toolpolicy, got: %v", err)
+	}
+}
+
+func TestValidateCommands_StartChildWorkflowExecution(t *testing.T) {
+	sameQueue := []*commandpb.Command{
+		{
+			Attributes: &commandpb.Command_StartChildWorkflowExecutionCommandAttributes{
+				StartChildWorkflowExecutionCommandAttributes: &commandpb.StartChildWorkflowExecutionCommandAttributes{
+					Namespace: "ns-a",
+					TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-a"},
+				},
+			},
+		},
+	}
+	if err := ValidateCommands(sameQueue, "ns-a", "queue-a"); err != nil {
+		t.Fatalf("expected matching namespace+queue to pass, got: %v", err)
+	}
+
+	crossQueue := []*commandpb.Command{
+		{
+			Attributes: &commandpb.Command_StartChildWorkflowExecutionCommandAttributes{
+				StartChildWorkflowExecutionCommandAttributes: &commandpb.StartChildWorkflowExecutionCommandAttributes{
+					Namespace: "ns-a",
+					TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-b"},
+				},
+			},
+		},
+	}
+	if err := ValidateCommands(crossQueue, "ns-a", "queue-a"); err == nil {
+		t.Fatalf("expected cross-queue StartChildWorkflowExecution command to be rejected")
+	}
+
+	crossNamespace := []*commandpb.Command{
+		{
+			Attributes: &commandpb.Command_StartChildWorkflowExecutionCommandAttributes{
+				StartChildWorkflowExecutionCommandAttributes: &commandpb.StartChildWorkflowExecutionCommandAttributes{
+					Namespace: "ns-b",
+					TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-a"},
+				},
+			},
+		},
+	}
+	if err := ValidateCommands(crossNamespace, "ns-a", "queue-a"); err == nil {
+		t.Fatalf("expected cross-namespace StartChildWorkflowExecution command to be rejected")
+	}
+
+	// Namespace unset means "same as parent" and must be allowed.
+	implicitNamespace := []*commandpb.Command{
+		{
+			Attributes: &commandpb.Command_StartChildWorkflowExecutionCommandAttributes{
+				StartChildWorkflowExecutionCommandAttributes: &commandpb.StartChildWorkflowExecutionCommandAttributes{
+					TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-a"},
+				},
+			},
+		},
+	}
+	if err := ValidateCommands(implicitNamespace, "ns-a", "queue-a"); err != nil {
+		t.Fatalf("expected unset namespace to be treated as same-namespace, got: %v", err)
+	}
+}
+
+func TestValidateCommands_ContinueAsNewWorkflowExecution(t *testing.T) {
+	// Unset TaskQueue means "same queue" and must be allowed.
+	implicitQueue := []*commandpb.Command{
+		{
+			Attributes: &commandpb.Command_ContinueAsNewWorkflowExecutionCommandAttributes{
+				ContinueAsNewWorkflowExecutionCommandAttributes: &commandpb.ContinueAsNewWorkflowExecutionCommandAttributes{},
+			},
+		},
+	}
+	if err := ValidateCommands(implicitQueue, "ns-a", "queue-a"); err != nil {
+		t.Fatalf("expected unset task queue to be treated as same-queue, got: %v", err)
+	}
+
+	crossQueue := []*commandpb.Command{
+		{
+			Attributes: &commandpb.Command_ContinueAsNewWorkflowExecutionCommandAttributes{
+				ContinueAsNewWorkflowExecutionCommandAttributes: &commandpb.ContinueAsNewWorkflowExecutionCommandAttributes{
+					TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-b"},
+				},
+			},
+		},
+	}
+	if err := ValidateCommands(crossQueue, "ns-a", "queue-a"); err == nil {
+		t.Fatalf("expected cross-queue ContinueAsNewWorkflowExecution command to be rejected")
+	}
+}
+
+func TestValidateCommands_UntargetedCommandsPassThrough(t *testing.T) {
+	commands := []*commandpb.Command{
+		{Attributes: &commandpb.Command_RecordMarkerCommandAttributes{RecordMarkerCommandAttributes: &commandpb.RecordMarkerCommandAttributes{MarkerName: "m"}}},
+		{Attributes: &commandpb.Command_CompleteWorkflowExecutionCommandAttributes{CompleteWorkflowExecutionCommandAttributes: &commandpb.CompleteWorkflowExecutionCommandAttributes{}}},
+	}
+	if err := ValidateCommands(commands, "ns-a", "queue-a"); err != nil {
+		t.Fatalf("expected untargeted commands to pass through, got: %v", err)
 	}
 }

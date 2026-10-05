@@ -18,10 +18,10 @@ import (
 
 	"github.com/02strich/temporal-untrusted-workers/internal/actions"
 	"github.com/02strich/temporal-untrusted-workers/internal/auth"
-	"github.com/02strich/temporal-untrusted-workers/internal/commandpolicy"
 	"github.com/02strich/temporal-untrusted-workers/internal/rpcpolicy"
 	"github.com/02strich/temporal-untrusted-workers/internal/scope"
 	"github.com/02strich/temporal-untrusted-workers/internal/tokencache"
+	"github.com/02strich/temporal-untrusted-workers/internal/toolpolicy"
 )
 
 var errMissingCredentials = errors.New("missing or malformed authorization metadata")
@@ -39,12 +39,13 @@ func IdentityFromContext(ctx context.Context) (auth.Identity, bool) {
 // NewInterceptor builds the single unary server interceptor that enforces
 // the entire access-control policy: RPC allowlisting, downstream API-key
 // authentication, namespace/task-queue/token scoping, and verification of
-// workflow commands via verifier (commandpolicy.BuiltIn when nil). It must
-// run before any handler - registering it via grpc.UnaryInterceptor on the
-// server that hosts proxy.Server guarantees that.
-func NewInterceptor(authenticator auth.Authenticator, cache tokencache.Store, verifier commandpolicy.Verifier) grpc.UnaryServerInterceptor {
+// the tool calls workflows make outside their task queue via verifier
+// (toolpolicy.Default when nil). It must run before any handler - registering
+// it via grpc.UnaryInterceptor on the server that hosts proxy.Server
+// guarantees that.
+func NewInterceptor(authenticator auth.Authenticator, cache tokencache.Store, verifier toolpolicy.Verifier) grpc.UnaryServerInterceptor {
 	if verifier == nil {
-		verifier = commandpolicy.BuiltIn{}
+		verifier = toolpolicy.Default{}
 	}
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		rpcName := rpcNameFromFullMethod(info.FullMethod)
@@ -95,12 +96,13 @@ func NewInterceptor(authenticator auth.Authenticator, cache tokencache.Store, ve
 			}
 		}
 		if protoResp, ok := resp.(proto.Message); ok {
-			for _, token := range scope.CollectResponseTaskTokens(protoResp) {
+			for _, issued := range scope.CollectResponseTaskTokens(protoResp) {
 				if scopedTaskQueue == "" {
 					slog.Error("missing task queue scope for response token", "rpc", rpcName, "subject", identity.Subject)
 					return nil, status.Error(codes.Internal, "proxy: missing task queue scope")
 				}
-				if err := cache.Put(ctx, token, tokencache.Entry{Namespace: identity.Namespace, TaskQueue: scopedTaskQueue}); err != nil {
+				entry := tokencache.Entry{Namespace: identity.Namespace, TaskQueue: scopedTaskQueue, WorkflowID: issued.WorkflowID}
+				if err := cache.Put(ctx, issued.Token, entry); err != nil {
 					slog.Error("token cache put failed after successful upstream RPC", "rpc", rpcName, "subject", identity.Subject, "error", err)
 					return nil, status.Error(codes.Unavailable, "token cache unavailable")
 				}
@@ -141,9 +143,9 @@ func grpcErrorForAuthorizationError(err error) error {
 	if errors.As(err, &cacheErr) {
 		return status.Error(codes.Unavailable, "token cache unavailable")
 	}
-	var verifierErr commandpolicy.UnavailableError
+	var verifierErr toolpolicy.UnavailableError
 	if errors.As(err, &verifierErr) {
-		return status.Error(codes.Unavailable, "command verifier unavailable")
+		return status.Error(codes.Unavailable, "tool verifier unavailable")
 	}
 	return status.Errorf(codes.PermissionDenied, "access denied: %s", err.Error())
 }
@@ -184,10 +186,12 @@ func extractAPIKey(ctx context.Context) (string, error) {
 
 // authorizeRequest checks req against identity's authorized namespace/task
 // queues, per policy.Category, and - for RespondWorkflowTaskCompleted -
-// additionally has verifier decide whether the request's commands may be
-// forwarded. It returns the concrete task queue this request is scoped to,
-// when one is established.
-func authorizeRequest(ctx context.Context, req proto.Message, rpcName string, policy rpcpolicy.Policy, identity auth.Identity, cache tokencache.Store, verifier commandpolicy.Verifier) (string, error) {
+// additionally checks the emitted commands: child workflows and
+// continue-as-new must stay on the token's task queue (and namespace), and the
+// tool calls leaving it (Nexus operations, activities on other task queues)
+// must be allowed by verifier. It returns the concrete task queue this request
+// is scoped to, when one is established.
+func authorizeRequest(ctx context.Context, req proto.Message, rpcName string, policy rpcpolicy.Policy, identity auth.Identity, cache tokencache.Store, verifier toolpolicy.Verifier) (string, error) {
 	switch policy.Category {
 	case rpcpolicy.CategoryPoll:
 		ns, _ := scope.RequestNamespace(req)
@@ -240,12 +244,20 @@ func authorizeRequest(ctx context.Context, req proto.Message, rpcName string, po
 
 		if rpcName == "RespondWorkflowTaskCompleted" {
 			if r, ok := req.(*workflowservice.RespondWorkflowTaskCompletedRequest); ok {
-				if err := verifier.Verify(ctx, commandpolicy.Request{
-					Identity:  identity,
-					TaskQueue: entry.TaskQueue,
-					Commands:  r.GetCommands(),
-				}); err != nil {
+				if err := scope.ValidateCommands(r.GetCommands(), identity.Namespace, entry.TaskQueue); err != nil {
 					return "", err
+				}
+				// Only pay for a verifier round trip when work leaves the
+				// task queue.
+				if calls := toolpolicy.FromCommands(r.GetCommands(), entry.TaskQueue); len(calls) > 0 {
+					if err := verifier.Verify(ctx, toolpolicy.Request{
+						Identity:   identity,
+						TaskQueue:  entry.TaskQueue,
+						WorkflowID: entry.WorkflowID,
+						Calls:      calls,
+					}); err != nil {
+						return "", err
+					}
 				}
 			}
 		}

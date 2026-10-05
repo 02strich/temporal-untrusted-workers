@@ -1,7 +1,9 @@
 // Package scope extracts the namespace/task-queue/task-token scoping
-// information from the WorkflowService RPCs the proxy allows. Validation of
-// the commands a RespondWorkflowTaskCompleted request emits lives in package
-// commandpolicy.
+// information from the WorkflowService RPCs the proxy allows, and validates
+// that a RespondWorkflowTaskCompleted request's child workflows and
+// continue-as-new don't leave the caller's namespace and scoped task queue.
+// Work that does leave the task queue (Nexus operations, activities on other
+// queues) is judged by package toolpolicy instead.
 //
 // Extraction is done via explicit per-RPC type switches over the concrete
 // go.temporal.io/api generated structs rather than reflection: it is a
@@ -13,6 +15,7 @@ package scope
 import (
 	"fmt"
 
+	commandpb "go.temporal.io/api/command/v1"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	workerpb "go.temporal.io/api/worker/v1"
 	"go.temporal.io/api/workflowservice/v1"
@@ -131,6 +134,14 @@ func RequestTaskToken(req proto.Message) ([]byte, bool) {
 	}
 }
 
+// IssuedToken is a task token handed out in a response, together with the
+// workflow it belongs to.
+type IssuedToken struct {
+	Token []byte
+	// WorkflowID is empty for Nexus tasks, which belong to no workflow.
+	WorkflowID string
+}
+
 // CollectResponseTaskTokens returns every task token embedded in a response
 // of an allowed RPC: the direct token on Poll responses, and - for
 // RespondWorkflowTaskCompletedResponse specifically - the new tokens Temporal
@@ -139,30 +150,30 @@ func RequestTaskToken(req proto.Message) ([]byte, bool) {
 // in the token cache under the calling identity, or a legitimate follow-up
 // Respond/Heartbeat call presenting one of these tokens would be wrongly
 // denied as unknown.
-func CollectResponseTaskTokens(resp proto.Message) [][]byte {
+func CollectResponseTaskTokens(resp proto.Message) []IssuedToken {
 	switch r := resp.(type) {
 	case *workflowservice.PollWorkflowTaskQueueResponse:
 		if tok := r.GetTaskToken(); len(tok) > 0 {
-			return [][]byte{tok}
+			return []IssuedToken{{Token: tok, WorkflowID: r.GetWorkflowExecution().GetWorkflowId()}}
 		}
 	case *workflowservice.PollActivityTaskQueueResponse:
 		if tok := r.GetTaskToken(); len(tok) > 0 {
-			return [][]byte{tok}
+			return []IssuedToken{{Token: tok, WorkflowID: r.GetWorkflowExecution().GetWorkflowId()}}
 		}
 	case *workflowservice.PollNexusTaskQueueResponse:
 		if tok := r.GetTaskToken(); len(tok) > 0 {
-			return [][]byte{tok}
+			return []IssuedToken{{Token: tok}}
 		}
 	case *workflowservice.RespondWorkflowTaskCompletedResponse:
-		var tokens [][]byte
+		var tokens []IssuedToken
 		if wt := r.GetWorkflowTask(); wt != nil {
 			if tok := wt.GetTaskToken(); len(tok) > 0 {
-				tokens = append(tokens, tok)
+				tokens = append(tokens, IssuedToken{Token: tok, WorkflowID: wt.GetWorkflowExecution().GetWorkflowId()})
 			}
 		}
 		for _, at := range r.GetActivityTasks() {
 			if tok := at.GetTaskToken(); len(tok) > 0 {
-				tokens = append(tokens, tok)
+				tokens = append(tokens, IssuedToken{Token: tok, WorkflowID: at.GetWorkflowExecution().GetWorkflowId()})
 			}
 		}
 		return tokens
@@ -192,4 +203,39 @@ func containsTaskQueue(taskQueues []string, taskQueue string) bool {
 		}
 	}
 	return false
+}
+
+// ValidateCommands checks the commands emitted by a RespondWorkflowTaskCompleted
+// call that must stay local to the caller's authorized namespace and the task
+// queue that issued the workflow task token:
+//
+//   - StartChildWorkflowExecutionCommandAttributes: TaskQueue.Name must equal
+//     taskQueue; Namespace, if set, must equal namespace (an empty Namespace
+//     means "same as parent").
+//   - ContinueAsNewWorkflowExecutionCommandAttributes: TaskQueue.Name, if
+//     set, must equal taskQueue (an empty TaskQueue means "same queue").
+//
+// ScheduleActivityTask and ScheduleNexusOperation are not checked here:
+// activities on taskQueue are always allowed, and activities on other queues
+// and Nexus operations are tool calls judged by package toolpolicy. All other
+// command types carry no task-queue/namespace targeting.
+func ValidateCommands(commands []*commandpb.Command, namespace, taskQueue string) error {
+	for _, cmd := range commands {
+		switch attr := cmd.GetAttributes().(type) {
+		case *commandpb.Command_StartChildWorkflowExecutionCommandAttributes:
+			a := attr.StartChildWorkflowExecutionCommandAttributes
+			if tq := a.GetTaskQueue().GetName(); tq != taskQueue {
+				return fmt.Errorf("StartChildWorkflowExecution command targets task queue %q, not authorized queue %q", tq, taskQueue)
+			}
+			if ns := a.GetNamespace(); ns != "" && ns != namespace {
+				return fmt.Errorf("StartChildWorkflowExecution command targets namespace %q, not authorized namespace %q", ns, namespace)
+			}
+		case *commandpb.Command_ContinueAsNewWorkflowExecutionCommandAttributes:
+			a := attr.ContinueAsNewWorkflowExecutionCommandAttributes
+			if tq := a.GetTaskQueue().GetName(); tq != "" && tq != taskQueue {
+				return fmt.Errorf("ContinueAsNewWorkflowExecution command targets task queue %q, not authorized queue %q", tq, taskQueue)
+			}
+		}
+	}
+	return nil
 }

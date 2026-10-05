@@ -205,7 +205,7 @@ func TestLoad_InvalidValkeyTLSMode(t *testing.T) {
 	})
 }
 
-func TestLoad_CommandVerifierDefaultsToBuiltIn(t *testing.T) {
+func TestLoad_ToolVerifierDefaultsToNone(t *testing.T) {
 	withEnv(t, map[string]string{
 		"TEMPORAL_PROXY_STATIC_AUTH_FILE": "/tmp/does-not-need-to-exist.json",
 	}, func() {
@@ -213,30 +213,30 @@ func TestLoad_CommandVerifierDefaultsToBuiltIn(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Load: %v", err)
 		}
-		if cfg.CommandVerifier.Mode != CommandVerifierBuiltIn {
-			t.Fatalf("unexpected default command verifier: %s", cfg.CommandVerifier.Mode)
+		if cfg.ToolVerifier.Mode != ToolVerifierNone {
+			t.Fatalf("unexpected default tool verifier: %s", cfg.ToolVerifier.Mode)
 		}
 	})
 }
 
-func TestLoad_NexusCommandVerifier(t *testing.T) {
+func TestLoad_NexusToolVerifier(t *testing.T) {
 	withEnv(t, map[string]string{
-		"TEMPORAL_PROXY_STATIC_AUTH_FILE":                 "/tmp/does-not-need-to-exist.json",
-		"TEMPORAL_PROXY_COMMAND_VERIFIER":                 CommandVerifierNexus,
-		"TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_NAMESPACE": "policy-ns",
-		"TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_ENDPOINT":  "policy-endpoint",
-		"TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_SERVICE":   "policy",
-		"TEMPORAL_PROXY_COMMAND_VERIFIER_TIMEOUT":         "2s",
+		"TEMPORAL_PROXY_STATIC_AUTH_FILE":              "/tmp/does-not-need-to-exist.json",
+		"TEMPORAL_PROXY_TOOL_VERIFIER":                 ToolVerifierNexus,
+		"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_NAMESPACE": "policy-ns",
+		"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_ENDPOINT":  "policy-endpoint",
+		"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_SERVICE":   "policy",
+		"TEMPORAL_PROXY_TOOL_VERIFIER_TIMEOUT":         "2s",
 	}, func() {
 		cfg, err := Load()
 		if err != nil {
 			t.Fatalf("Load: %v", err)
 		}
-		v := cfg.CommandVerifier
+		v := cfg.ToolVerifier
 		if v.NexusNamespace != "policy-ns" || v.NexusEndpoint != "policy-endpoint" || v.NexusService != "policy" {
 			t.Fatalf("unexpected nexus verifier config: %+v", v)
 		}
-		if v.NexusOperation != "VerifyCommands" {
+		if v.NexusOperation != "VerifyToolCalls" {
 			t.Fatalf("unexpected default operation: %s", v.NexusOperation)
 		}
 		if v.Timeout.String() != "2s" {
@@ -245,10 +245,10 @@ func TestLoad_NexusCommandVerifier(t *testing.T) {
 	})
 }
 
-func TestLoad_NexusCommandVerifierRequiresTarget(t *testing.T) {
+func TestLoad_NexusToolVerifierRequiresTarget(t *testing.T) {
 	withEnv(t, map[string]string{
 		"TEMPORAL_PROXY_STATIC_AUTH_FILE": "/tmp/does-not-need-to-exist.json",
-		"TEMPORAL_PROXY_COMMAND_VERIFIER": CommandVerifierNexus,
+		"TEMPORAL_PROXY_TOOL_VERIFIER":    ToolVerifierNexus,
 	}, func() {
 		if _, err := Load(); err == nil {
 			t.Fatalf("expected error when nexus verifier is set without namespace/endpoint/service")
@@ -256,26 +256,26 @@ func TestLoad_NexusCommandVerifierRequiresTarget(t *testing.T) {
 	})
 }
 
-func TestLoad_InvalidCommandVerifier(t *testing.T) {
+func TestLoad_InvalidToolVerifier(t *testing.T) {
 	withEnv(t, map[string]string{
-		"TEMPORAL_PROXY_STATIC_AUTH_FILE":         "/tmp/does-not-need-to-exist.json",
-		"TEMPORAL_PROXY_COMMAND_VERIFIER":         "bogus",
-		"TEMPORAL_PROXY_COMMAND_VERIFIER_TIMEOUT": "-1s",
+		"TEMPORAL_PROXY_STATIC_AUTH_FILE":      "/tmp/does-not-need-to-exist.json",
+		"TEMPORAL_PROXY_TOOL_VERIFIER":         "bogus",
+		"TEMPORAL_PROXY_TOOL_VERIFIER_TIMEOUT": "-1s",
 	}, func() {
 		if _, err := Load(); err == nil {
-			t.Fatalf("expected error for invalid command verifier")
+			t.Fatalf("expected error for invalid tool verifier")
 		}
 	})
 }
 
-func TestLoad_NexusCommandVerifierInvalidTimeout(t *testing.T) {
+func TestLoad_NexusToolVerifierInvalidTimeout(t *testing.T) {
 	withEnv(t, map[string]string{
-		"TEMPORAL_PROXY_STATIC_AUTH_FILE":                 "/tmp/does-not-need-to-exist.json",
-		"TEMPORAL_PROXY_COMMAND_VERIFIER":                 CommandVerifierNexus,
-		"TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_NAMESPACE": "policy-ns",
-		"TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_ENDPOINT":  "policy-endpoint",
-		"TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_SERVICE":   "policy",
-		"TEMPORAL_PROXY_COMMAND_VERIFIER_TIMEOUT":         "0s",
+		"TEMPORAL_PROXY_STATIC_AUTH_FILE":              "/tmp/does-not-need-to-exist.json",
+		"TEMPORAL_PROXY_TOOL_VERIFIER":                 ToolVerifierNexus,
+		"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_NAMESPACE": "policy-ns",
+		"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_ENDPOINT":  "policy-endpoint",
+		"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_SERVICE":   "policy",
+		"TEMPORAL_PROXY_TOOL_VERIFIER_TIMEOUT":         "0s",
 	}, func() {
 		if _, err := Load(); err == nil {
 			t.Fatalf("expected error for non-positive verifier timeout")

@@ -17,8 +17,9 @@ import (
 const valkeyKeyPrefix = "temporal-proxy:task-token:"
 
 type valkeyEntry struct {
-	Namespace string `json:"namespace"`
-	TaskQueue string `json:"task_queue"`
+	Namespace  string `json:"namespace"`
+	TaskQueue  string `json:"task_queue"`
+	WorkflowID string `json:"workflow_id"`
 }
 
 type valkeyClient interface {
@@ -106,8 +107,9 @@ func (s *ValkeyStore) Close() error {
 
 func encodeValkeyEntry(entry Entry) (string, error) {
 	b, err := json.Marshal(valkeyEntry{
-		Namespace: entry.Namespace,
-		TaskQueue: entry.TaskQueue,
+		Namespace:  entry.Namespace,
+		TaskQueue:  entry.TaskQueue,
+		WorkflowID: entry.WorkflowID,
 	})
 	if err != nil {
 		return "", fmt.Errorf("encode valkey token entry: %w", err)
@@ -120,7 +122,7 @@ func decodeValkeyEntry(value string) (Entry, error) {
 	if err := json.Unmarshal([]byte(value), &stored); err != nil {
 		return Entry{}, fmt.Errorf("decode valkey token entry: %w", err)
 	}
-	return Entry{Namespace: stored.Namespace, TaskQueue: stored.TaskQueue}, nil
+	return Entry{Namespace: stored.Namespace, TaskQueue: stored.TaskQueue, WorkflowID: stored.WorkflowID}, nil
 }
 
 func tokenKey(token []byte) string {

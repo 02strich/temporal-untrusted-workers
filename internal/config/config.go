@@ -28,10 +28,10 @@ const (
 	TokenCacheBackendLocal  = "local"
 	TokenCacheBackendValkey = "valkey"
 
-	CommandVerifierBuiltIn = "builtin"
-	CommandVerifierNexus   = "nexus"
+	ToolVerifierNone  = "none"
+	ToolVerifierNexus = "nexus"
 
-	defaultCommandVerifierNexusOperation = "VerifyCommands"
+	defaultToolVerifierNexusOperation = "VerifyToolCalls"
 )
 
 // UpstreamConfig configures the proxy's connection to the real Temporal
@@ -68,12 +68,13 @@ type ValkeyConfig struct {
 	WriteTimeout time.Duration
 }
 
-// CommandVerifierConfig selects how RespondWorkflowTaskCompleted commands are
-// verified: by the built-in policy, or by an operator-provided Nexus service.
-type CommandVerifierConfig struct {
-	Mode string // CommandVerifierBuiltIn | CommandVerifierNexus
+// ToolVerifierConfig selects how the tool calls workflows make outside their
+// task queue (Nexus operations, activities on other task queues) are judged:
+// by the proxy's default rule, or by an operator-provided Nexus service.
+type ToolVerifierConfig struct {
+	Mode string // ToolVerifierNone | ToolVerifierNexus
 
-	// The fields below apply only when Mode == CommandVerifierNexus.
+	// The fields below apply only when Mode == ToolVerifierNexus.
 	NexusNamespace string
 	NexusEndpoint  string
 	NexusService   string
@@ -97,7 +98,7 @@ type Config struct {
 	TokenCacheMaxSize int
 	Valkey            ValkeyConfig
 
-	CommandVerifier CommandVerifierConfig
+	ToolVerifier ToolVerifierConfig
 
 	LogLevel string
 }
@@ -136,12 +137,12 @@ func Load() (Config, error) {
 			TLSMode:   getEnv("TEMPORAL_PROXY_VALKEY_TLS_MODE", TLSModeTLS),
 			TLSCAFile: os.Getenv("TEMPORAL_PROXY_VALKEY_TLS_CA_FILE"),
 		},
-		CommandVerifier: CommandVerifierConfig{
-			Mode:           getEnv("TEMPORAL_PROXY_COMMAND_VERIFIER", CommandVerifierBuiltIn),
-			NexusNamespace: os.Getenv("TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_NAMESPACE"),
-			NexusEndpoint:  os.Getenv("TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_ENDPOINT"),
-			NexusService:   os.Getenv("TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_SERVICE"),
-			NexusOperation: getEnv("TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_OPERATION", defaultCommandVerifierNexusOperation),
+		ToolVerifier: ToolVerifierConfig{
+			Mode:           getEnv("TEMPORAL_PROXY_TOOL_VERIFIER", ToolVerifierNone),
+			NexusNamespace: os.Getenv("TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_NAMESPACE"),
+			NexusEndpoint:  os.Getenv("TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_ENDPOINT"),
+			NexusService:   os.Getenv("TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_SERVICE"),
+			NexusOperation: getEnv("TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_OPERATION", defaultToolVerifierNexusOperation),
 		},
 		LogLevel: getEnv("TEMPORAL_PROXY_LOG_LEVEL", "info"),
 	}
@@ -184,11 +185,11 @@ func Load() (Config, error) {
 	}
 	cfg.Valkey.WriteTimeout = valkeyWriteTimeout
 
-	verifierTimeout, err := getEnvDuration("TEMPORAL_PROXY_COMMAND_VERIFIER_TIMEOUT", 5*time.Second)
+	verifierTimeout, err := getEnvDuration("TEMPORAL_PROXY_TOOL_VERIFIER_TIMEOUT", 5*time.Second)
 	if err != nil {
 		errs = append(errs, err)
 	}
-	cfg.CommandVerifier.Timeout = verifierTimeout
+	cfg.ToolVerifier.Timeout = verifierTimeout
 
 	errs = append(errs, cfg.validate()...)
 
@@ -275,25 +276,25 @@ func (c Config) validate() []error {
 		errs = append(errs, errors.New("TEMPORAL_PROXY_VALKEY_WRITE_TIMEOUT must be positive"))
 	}
 
-	switch c.CommandVerifier.Mode {
-	case CommandVerifierBuiltIn:
-	case CommandVerifierNexus:
+	switch c.ToolVerifier.Mode {
+	case ToolVerifierNone:
+	case ToolVerifierNexus:
 		required := []struct{ name, value string }{
-			{"TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_NAMESPACE", c.CommandVerifier.NexusNamespace},
-			{"TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_ENDPOINT", c.CommandVerifier.NexusEndpoint},
-			{"TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_SERVICE", c.CommandVerifier.NexusService},
-			{"TEMPORAL_PROXY_COMMAND_VERIFIER_NEXUS_OPERATION", c.CommandVerifier.NexusOperation},
+			{"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_NAMESPACE", c.ToolVerifier.NexusNamespace},
+			{"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_ENDPOINT", c.ToolVerifier.NexusEndpoint},
+			{"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_SERVICE", c.ToolVerifier.NexusService},
+			{"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_OPERATION", c.ToolVerifier.NexusOperation},
 		}
 		for _, r := range required {
 			if r.value == "" {
-				errs = append(errs, fmt.Errorf("%s is required when TEMPORAL_PROXY_COMMAND_VERIFIER=nexus", r.name))
+				errs = append(errs, fmt.Errorf("%s is required when TEMPORAL_PROXY_TOOL_VERIFIER=nexus", r.name))
 			}
 		}
-		if c.CommandVerifier.Timeout <= 0 {
-			errs = append(errs, errors.New("TEMPORAL_PROXY_COMMAND_VERIFIER_TIMEOUT must be positive"))
+		if c.ToolVerifier.Timeout <= 0 {
+			errs = append(errs, errors.New("TEMPORAL_PROXY_TOOL_VERIFIER_TIMEOUT must be positive"))
 		}
 	default:
-		errs = append(errs, fmt.Errorf("TEMPORAL_PROXY_COMMAND_VERIFIER: invalid value %q (want %q or %q)", c.CommandVerifier.Mode, CommandVerifierBuiltIn, CommandVerifierNexus))
+		errs = append(errs, fmt.Errorf("TEMPORAL_PROXY_TOOL_VERIFIER: invalid value %q (want %q or %q)", c.ToolVerifier.Mode, ToolVerifierNone, ToolVerifierNexus))
 	}
 
 	return errs
