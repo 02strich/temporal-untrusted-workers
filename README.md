@@ -268,6 +268,14 @@ untrusted workers may do.
 
 ---
 
+## Demos
+
+[`demos/`](demos) has scripted, recordable walkthroughs that each run a complete local stack. For
+example, [`demos/cedar-tool-calls`](demos/cedar-tool-calls) shows untrusted workflows calling
+trusted tools, allowed or blocked by Cedar policies.
+
+---
+
 ## The verify examples
 
 `examples/` holds three small programs used to exercise the proxy end-to-end, across two ecosystems:
