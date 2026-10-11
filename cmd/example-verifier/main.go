@@ -5,7 +5,9 @@
 // VerifyToolCalls operation that receives a toolpolicypb.VerifyToolCallsRequest
 // and returns a toolpolicypb.VerifyToolCallsResponse (see
 // proto/toolpolicy/v1/toolpolicy.proto). As its policy it allows the tool
-// names listed in VERIFIER_ALLOWED_TOOLS; replace verify with your own rules.
+// names listed in VERIFIER_ALLOWED_TOOLS, escalates those listed in
+// VERIFIER_ESCALATE_TOOLS to human review, and denies the rest; replace
+// verifier with your own rules.
 //
 // The request arrives as json/protobuf, which the SDK decodes with the
 // protobuf JSON decoder: every parameter's "@type" must resolve to a type
@@ -45,10 +47,11 @@ func run() error {
 	serviceName := getEnv("VERIFIER_SERVICE", "tool-policy")
 	operationName := getEnv("VERIFIER_OPERATION", toolpolicy.DefaultNexusOperation)
 
-	allowed := parseAllowedTools(os.Getenv("VERIFIER_ALLOWED_TOOLS"))
+	allowed := parseToolList(os.Getenv("VERIFIER_ALLOWED_TOOLS"))
 	if allowed == nil {
-		slog.Warn("VERIFIER_ALLOWED_TOOLS is unset: allowing every tool call")
+		slog.Warn("VERIFIER_ALLOWED_TOOLS is unset: allowing every tool call not listed in VERIFIER_ESCALATE_TOOLS")
 	}
+	escalate := parseToolList(os.Getenv("VERIFIER_ESCALATE_TOOLS"))
 
 	opts := client.Options{HostPort: address, Namespace: namespace}
 	if apiKey := os.Getenv("TEMPORAL_API_KEY"); apiKey != "" {
@@ -62,7 +65,7 @@ func run() error {
 	defer c.Close()
 
 	service := nexus.NewService(serviceName)
-	if err := service.Register(nexus.NewSyncOperation(operationName, verifier(allowed))); err != nil {
+	if err := service.Register(nexus.NewSyncOperation(operationName, verifier(allowed, escalate))); err != nil {
 		return fmt.Errorf("registering operation: %w", err)
 	}
 
@@ -73,36 +76,60 @@ func run() error {
 	return w.Run(worker.InterruptCh())
 }
 
-// parseAllowedTools parses a comma-separated list of tool names; nil means
-// "allow everything".
-func parseAllowedTools(list string) map[string]bool {
+// parseToolList parses a comma-separated list of tool names; nil means the
+// list is unset.
+func parseToolList(list string) map[string]bool {
 	if strings.TrimSpace(list) == "" {
 		return nil
 	}
-	allowed := map[string]bool{}
+	tools := map[string]bool{}
 	for _, name := range strings.Split(list, ",") {
 		if name = strings.TrimSpace(name); name != "" {
-			allowed[name] = true
+			tools[name] = true
 		}
 	}
-	return allowed
+	return tools
 }
 
-// verifier returns the VerifyToolCalls operation handler. Returning an error
-// fails the operation, which the proxy treats as "verifier unavailable" and
-// fails closed; a policy rejection is reported as Allowed=false instead.
-func verifier(allowed map[string]bool) func(context.Context, *toolpolicypb.VerifyToolCallsRequest, nexus.StartOperationOptions) (*toolpolicypb.VerifyToolCallsResponse, error) {
+// verifier returns the VerifyToolCalls operation handler: a tool listed in
+// escalate needs human review, a tool not in allowed (when set) is denied, and
+// a denial outweighs an escalation. Returning an error fails the operation,
+// which the proxy treats as "verifier unavailable" and fails closed; policy
+// outcomes are reported as decisions instead.
+func verifier(allowed, escalate map[string]bool) func(context.Context, *toolpolicypb.VerifyToolCallsRequest, nexus.StartOperationOptions) (*toolpolicypb.VerifyToolCallsResponse, error) {
 	return func(_ context.Context, req *toolpolicypb.VerifyToolCallsRequest, _ nexus.StartOperationOptions) (*toolpolicypb.VerifyToolCallsResponse, error) {
-		caller := req.GetCaller()
-		for _, call := range req.GetToolCalls() {
-			if allowed != nil && !allowed[call.GetName()] {
-				reason := fmt.Sprintf("tool %q is not allowed", call.GetName())
-				slog.Info("tool call denied", "namespace", caller.GetNamespace(), "task_queue", caller.GetTaskQueue(), "workflow_id", caller.GetWorkflowId(), "subject", caller.GetSubject(), "tool", call.GetName())
-				return &toolpolicypb.VerifyToolCallsResponse{Allowed: false, Reason: reason}, nil
+		resp := decide(req, allowed, escalate)
+		if resp.GetDecision() != toolpolicypb.Decision_DECISION_APPROVED {
+			caller := req.GetCaller()
+			slog.Info("tool calls not approved", "decision", resp.GetDecision(), "reason", resp.GetReason(), "namespace", caller.GetNamespace(), "task_queue", caller.GetTaskQueue(), "workflow_id", caller.GetWorkflowId(), "subject", caller.GetSubject())
+		}
+		return resp, nil
+	}
+}
+
+func decide(req *toolpolicypb.VerifyToolCallsRequest, allowed, escalate map[string]bool) *toolpolicypb.VerifyToolCallsResponse {
+	var escalated *toolpolicypb.VerifyToolCallsResponse
+	for _, call := range req.GetToolCalls() {
+		name := call.GetName()
+		switch {
+		case escalate[name]:
+			if escalated == nil {
+				escalated = &toolpolicypb.VerifyToolCallsResponse{
+					Decision: toolpolicypb.Decision_DECISION_ESCALATE,
+					Reason:   fmt.Sprintf("tool %q needs human approval", name),
+				}
+			}
+		case allowed != nil && !allowed[name]:
+			return &toolpolicypb.VerifyToolCallsResponse{
+				Decision: toolpolicypb.Decision_DECISION_DENIED,
+				Reason:   fmt.Sprintf("tool %q is not allowed", name),
 			}
 		}
-		return &toolpolicypb.VerifyToolCallsResponse{Allowed: true}, nil
 	}
+	if escalated != nil {
+		return escalated
+	}
+	return &toolpolicypb.VerifyToolCallsResponse{Decision: toolpolicypb.Decision_DECISION_APPROVED}
 }
 
 func getEnv(key, def string) string {

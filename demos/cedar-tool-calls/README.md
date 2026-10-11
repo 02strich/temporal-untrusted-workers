@@ -15,12 +15,15 @@ The walkthrough ([`demo.tape`](demo.tape), about 70 seconds):
 2. Shows the policy.
 3. **Allowed:** an echo call, a 500 USD charge, and an email to `alice@example.com` all reach the
    trusted handlers.
-4. **Blocked by Cedar:** a 5000 USD charge (`charge-limit-1000`) and an email to `mallory@evil.com`
-   (no policy permits it).
+4. **Blocked by Cedar:**
+   - a 5000 USD charge is escalated for human review (`charge-over-1000-needs-review`, answered as
+     `DECISION_ESCALATE`);
+   - a 50000 USD charge is denied outright (`charge-limit-10000`);
+   - an email to `mallory@evil.com` is denied because no policy permits it.
 5. **Blocked by the proxy itself:** a child workflow on another task queue. The verifier is never
    asked.
-6. **Live policy edit:** the charge limit is raised to 10000, the verifier is restarted, and the same
-   5000 charge now goes through.
+6. **Live policy edit:** the review threshold is raised to 10000, the verifier is restarted, and the
+   same 5000 charge now goes through.
 
 ## Running it yourself
 
@@ -29,7 +32,7 @@ Requirements: Go, Rust and the Temporal CLI.
 ```bash
 ./up.sh
 source env.sh
-demo run echo charge-ok charge-big email-ok email-bad child-cross
+demo run echo charge-ok charge-big charge-huge email-ok email-bad child-cross
 ```
 
 Edit `run/policy.cedar` (a copy of the example policy) and run `./restart-verifier.sh` to try your

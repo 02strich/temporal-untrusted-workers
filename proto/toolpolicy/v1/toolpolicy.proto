@@ -73,10 +73,37 @@ message ToolCall {
   repeated google.protobuf.Any parameters = 2;
 }
 
-// VerifyToolCallsResponse is the verifier's decision. The zero value denies.
+// VerifyToolCallsResponse is the verifier's decision on all tool calls of
+// the request. The zero value denies.
 message VerifyToolCallsResponse {
-  // Whether all tool calls may be forwarded upstream.
-  bool allowed = 1;
-  // Why the tool calls were rejected; returned to the worker when allowed is false.
+  // Was `bool allowed`; reserved so an old verifier's answer is never misread.
+  reserved 1;
+  reserved "allowed";
+
+  // The decision. Anything other than DECISION_APPROVED rejects the workflow
+  // task; the worker retries it on the task's normal timeout.
+  Decision decision = 3;
+  // Why the tool calls were not approved; returned to the worker.
   string reason = 2;
+}
+
+// Decision is a verifier's verdict on a request's tool calls.
+enum Decision {
+  // No decision; treated as DECISION_DENIED (fail closed). Unknown future
+  // values are treated the same way.
+  DECISION_UNSPECIFIED = 0;
+  // The tool calls may be forwarded upstream.
+  DECISION_APPROVED = 1;
+  // The tool calls are not allowed. The proxy rejects the workflow task with
+  // PermissionDenied.
+  DECISION_DENIED = 2;
+  // The tool calls need a human's approval. The proxy currently treats this
+  // like DECISION_DENIED, with a "pending human review" reason; approving
+  // escalated calls is up to the verifier (e.g. answering DECISION_APPROVED
+  // on a later attempt).
+  DECISION_ESCALATE = 3;
+  // The verifier can't decide right now (rate limit, a dependency is down).
+  // The proxy rejects the workflow task with Unavailable, as if the verifier
+  // were unreachable.
+  DECISION_RETRY_LATER = 4;
 }

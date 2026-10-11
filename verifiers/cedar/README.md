@@ -14,8 +14,8 @@ policy file, not writing code.
 
 ## How tool calls map to Cedar
 
-Every tool call becomes one authorization request. A workflow task is allowed only if all of its
-tool calls are.
+Every tool call becomes one authorization request. A workflow task is approved only if all of its
+tool calls are allowed.
 
 | Cedar | Value |
 |-------|-------|
@@ -30,7 +30,16 @@ Each tool is its own action, so [`policies/schema.cedarschema`](policies/schema.
 declares the shape of its parameters. Cedar denies by default, so a tool no policy permits,
 including any tool the schema doesn't declare, is rejected. A denial is reported to the worker with
 the `@id` of the deciding policy, for example
-`tool payments/billing/Charge denied by Cedar policy charge-limit-1000`.
+`tool payments/billing/Charge denied by Cedar policy charge-limit-10000`.
+
+### Escalating to a human
+
+Cedar only allows or denies. To ask for human review instead, annotate a `forbid` policy with
+`@decision("escalate")`. When every policy that denied a call carries the annotation, the verifier
+answers `DECISION_ESCALATE` rather than `DECISION_DENIED`, and the proxy rejects the task with a
+`pending human review: …` reason. A plain `forbid` that also applies wins, and so does any other
+call in the same task that is denied outright. Approving escalated calls, for example by remembering
+an approval and answering `DECISION_APPROVED` when the worker retries, is up to you.
 
 ### Parameters
 
@@ -57,8 +66,11 @@ them as `String` or use 32-bit fields.
 
 [`policies/example.cedar`](policies/example.cedar) allows:
 - the Nexus operation `echo/echo/Echo`, for everyone;
-- the Nexus operation `payments/billing/Charge`, in USD or EUR, and never above 1000 (the
-  `charge-limit-1000` `forbid` overrides the `permit`);
+- the Nexus operation `payments/billing/Charge`, in USD or EUR:
+  - up to 1000 it goes through;
+  - above 1000 it is escalated for review (`charge-over-1000-needs-review`, a `forbid` annotated
+    `@decision("escalate")`);
+  - above 10000, or without an amount, it is denied (`charge-limit-10000`);
 - the activity `trusted-tools/SendEmail`, only to `@example.com` addresses.
 
 ## Declaring a tool

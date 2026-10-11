@@ -31,7 +31,9 @@ const DefaultNexusOperation = "VerifyToolCalls"
 // The operation receives a toolpolicypb.VerifyToolCallsRequest as a
 // "json/protobuf" payload and must complete (synchronously, or
 // asynchronously within Timeout) with a toolpolicypb.VerifyToolCallsResponse
-// payload. allowed=false denies the call with the given reason. A failed
+// payload. Only decision=DECISION_APPROVED allows the call: DENIED, ESCALATE
+// and unspecified or unknown decisions deny it (ESCALATE with a "pending human
+// review" reason), and RETRY_LATER is reported as Unavailable. A failed
 // operation, a malformed result, or no result within Timeout makes the proxy
 // fail closed with Unavailable. A tool call whose parameters could not be
 // rendered (Call.Err) is denied without contacting the verifier.
@@ -174,14 +176,37 @@ func decodeVerifyResponse(result *commonpb.Payload) error {
 	if err != nil {
 		return UnavailableError{Err: fmt.Errorf("decoding verifier result: %w", err)}
 	}
-	if !out.GetAllowed() {
-		reason := out.GetReason()
+	return decisionError(out.GetDecision(), out.GetReason())
+}
+
+// decisionError maps a verifier decision to the Verify result. Only
+// DECISION_APPROVED allows the call; an unspecified or unknown decision is a
+// denial (fail closed).
+func decisionError(decision toolpolicypb.Decision, reason string) error {
+	switch decision {
+	case toolpolicypb.Decision_DECISION_APPROVED:
+		return nil
+	case toolpolicypb.Decision_DECISION_ESCALATE:
+		if reason == "" {
+			reason = "escalated by tool verifier"
+		}
+		return DeniedError{Reason: "pending human review: " + reason}
+	case toolpolicypb.Decision_DECISION_RETRY_LATER:
+		if reason == "" {
+			reason = "no reason given"
+		}
+		return UnavailableError{Err: fmt.Errorf("verifier asked to retry later: %s", reason)}
+	case toolpolicypb.Decision_DECISION_DENIED:
 		if reason == "" {
 			reason = "tool calls rejected by tool verifier"
 		}
 		return DeniedError{Reason: reason}
+	default:
+		if reason == "" {
+			reason = fmt.Sprintf("tool verifier returned no usable decision (%v)", decision)
+		}
+		return DeniedError{Reason: reason}
 	}
-	return nil
 }
 
 func randomID() (string, error) {

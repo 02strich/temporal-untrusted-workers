@@ -16,8 +16,12 @@ Set TypingSpeed 30ms
 
 # --- setup (not recorded) ---------------------------------------------------
 Hide
-Type "./down.sh; rm -rf run; source env.sh; export PS1='\[\e[36m\]$ \[\e[0m\]'; clear" Enter
-Sleep 3s
+Type "./down.sh; rm -rf run; source env.sh; export PS1='\[\e[36m\]$ \[\e[0m\]'" Enter
+# Warm the build caches so up.sh doesn't compile on camera.
+Type "(cd $REPO_DIR/verifiers/cedar && cargo build -q --release) && (cd $DEMOS_DIR && go build -o /dev/null ./cedar-tool-calls) && (cd $REPO_DIR && go build -o /dev/null ./cmd/temporal-proxy) && clear && echo ready" Enter
+Wait+Screen@600s /^ready/
+Type "clear" Enter
+Sleep 1s
 Show
 
 # --- intro --------------------------------------------------------------------
@@ -52,9 +56,9 @@ Wait+Screen@60s /email sent to alice/
 Sleep 4s
 
 # --- blocked calls --------------------------------------------------------------
-Type "# Calls it doesn't permit are rejected before they reach Temporal:"
+Type "# Others are escalated for human review, or denied outright:"
 Enter
-Type "demo run charge-big email-bad"
+Type "demo run charge-big charge-huge email-bad"
 Enter
 Wait+Screen@60s /SendEmail not permitted/
 Sleep 4s
@@ -72,11 +76,11 @@ Sleep 4s
 Type "clear" Enter
 
 # --- change the policy live -----------------------------------------------------
-Type "# Policies, not code: raise the charge limit to 10000 ..."
+Type "# Policies, not code: raise the review threshold to 10000 ..."
 Enter
 Type "sed -i '' 's/<= 1000$/<= 10000/' run/policy.cedar"
 Enter
-Type "grep -B3 '<= 10000' run/policy.cedar"
+Type "grep -A6 '@decision' run/policy.cedar"
 Enter
 Sleep 3s
 Type "./restart-verifier.sh"

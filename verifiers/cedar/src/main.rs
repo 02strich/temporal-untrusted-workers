@@ -261,8 +261,12 @@ impl Handler {
                 );
             }
         };
-        if !verdict.allowed {
-            tracing::info!(reason = %verdict.reason, "tool calls denied");
+        if !verdict.allowed() {
+            tracing::info!(
+                decision = verdict.decision.proto_name(),
+                reason = %verdict.reason,
+                "tool calls not approved"
+            );
         }
         nexus_task_completion::Status::Completed(Response {
             variant: Some(response::Variant::StartOperation(StartOperationResponse {
@@ -279,7 +283,10 @@ impl Handler {
 
 /// Encodes a verdict as a `VerifyToolCallsResponse` in the protobuf JSON mapping.
 fn response_payload(verdict: &Verdict) -> Payload {
-    let body = serde_json::json!({ "allowed": verdict.allowed, "reason": verdict.reason });
+    let body = serde_json::json!({
+        "decision": verdict.decision.proto_name(),
+        "reason": verdict.reason,
+    });
     Payload {
         metadata: HashMap::from([
             ("encoding".to_owned(), b"json/protobuf".to_vec()),

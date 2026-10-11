@@ -236,16 +236,25 @@ from it lives in `gen/toolpolicy/v1`; run `make generate` after changing the pro
   A verifier decoding the request with a protobuf JSON decoder must be able to resolve the
   parameter types it receives. Alternatively, it can treat parameters as plain JSON.
 
-**Output**: `VerifyToolCallsResponse` (`allowed`, `reason`), as a `json/protobuf` or
-`binary/protobuf` payload. Plain JSON such as `{"allowed": true}` also works.
+**Output**: `VerifyToolCallsResponse` (`decision`, `reason`), as a `json/protobuf` or
+`binary/protobuf` payload. Plain JSON such as `{"decision": "DECISION_APPROVED"}` also works.
 
-- `allowed: false`, or an empty response, rejects the worker's call with `PermissionDenied` and the
-  reason.
+| `decision` | The proxy |
+|------------|-----------|
+| `DECISION_APPROVED` | forwards the workflow task |
+| `DECISION_DENIED` | rejects it with `PermissionDenied` and the reason |
+| `DECISION_ESCALATE` | needs human approval. Currently treated like `DECISION_DENIED`, with a `pending human review: …` reason. Approving escalated calls is up to the verifier, for example by answering `DECISION_APPROVED` when the worker retries the task. |
+| `DECISION_RETRY_LATER` | the verifier can't decide right now (rate limit, a dependency is down). Rejected with `Unavailable`, like a verifier outage. |
+| `DECISION_UNSPECIFIED`, an unknown value, or an empty response | denied |
+
+A rejected workflow task isn't recorded in the workflow's history; the worker retries it on the
+task's normal timeout.
+
 - The proxy **fails closed**. A failed operation, a malformed result, or no result within
   `TEMPORAL_PROXY_TOOL_VERIFIER_TIMEOUT` rejects the call with `Unavailable`, and the worker retries.
 
 `cmd/example-verifier` is a reference handler in Go. It allows the tool names listed in
-`VERIFIER_ALLOWED_TOOLS`:
+`VERIFIER_ALLOWED_TOOLS`, escalates those listed in `VERIFIER_ESCALATE_TOOLS`, and denies the rest:
 
 ```bash
 temporal operator nexus endpoint create --name tool-verifier \

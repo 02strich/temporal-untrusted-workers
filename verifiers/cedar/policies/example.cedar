@@ -16,13 +16,24 @@ when {
   ["USD", "EUR"].contains(context.parameters.arg0.data.currency)
 };
 
-// ...but never above 1000, and never without an amount.
-@id("charge-limit-1000")
+// ...charges above 1000 need a human's approval (a forbid annotated
+// @decision("escalate") answers DECISION_ESCALATE instead of DECISION_DENIED)...
+@id("charge-over-1000-needs-review")
+@decision("escalate")
 forbid (principal, action == Action::"payments/billing/Charge", resource)
 unless {
   context.parameters has arg0 &&
   context.parameters.arg0.data has amount &&
   context.parameters.arg0.data.amount <= 1000
+};
+
+// ...and charges above 10000, or without an amount, are never allowed.
+@id("charge-limit-10000")
+forbid (principal, action == Action::"payments/billing/Charge", resource)
+unless {
+  context.parameters has arg0 &&
+  context.parameters.arg0.data has amount &&
+  context.parameters.arg0.data.amount <= 10000
 };
 
 // The SendEmail activity, hosted by trusted workers on the trusted-tools task

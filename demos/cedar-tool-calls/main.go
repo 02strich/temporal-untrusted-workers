@@ -36,6 +36,7 @@ var cases = map[string]string{
 	"echo":        `Nexus     echo/echo/Echo("hi")`,
 	"charge-ok":   `Nexus     payments/billing/Charge({amount: 500, currency: "USD"})`,
 	"charge-big":  `Nexus     payments/billing/Charge({amount: 5000, currency: "USD"})`,
+	"charge-huge": `Nexus     payments/billing/Charge({amount: 50000, currency: "USD"})`,
 	"email-ok":    `Activity  trusted-tools/SendEmail("alice@example.com")`,
 	"email-bad":   `Activity  trusted-tools/SendEmail("mallory@evil.com")`,
 	"child-cross": `Child     workflow on task queue "other-queue"`,
@@ -48,11 +49,8 @@ func ToolWorkflow(ctx workflow.Context, kase string) (string, error) {
 	case "echo":
 		err := workflow.NewNexusClient("echo", "echo").ExecuteOperation(ctx, "Echo", "hi", nexusOpts).Get(ctx, &out)
 		return out, err
-	case "charge-ok", "charge-big":
-		amount := int64(500)
-		if kase == "charge-big" {
-			amount = 5000
-		}
+	case "charge-ok", "charge-big", "charge-huge":
+		amount := map[string]int64{"charge-ok": 500, "charge-big": 5000, "charge-huge": 50000}[kase]
 		err := workflow.NewNexusClient("payments", "billing").ExecuteOperation(ctx, "Charge", Charge{Amount: amount, Currency: "USD"}, nexusOpts).Get(ctx, &out)
 		return out, err
 	case "email-ok", "email-bad":

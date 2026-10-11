@@ -115,7 +115,7 @@ func testRequest() Request {
 }
 
 func TestNexusVerifier_Allowed(t *testing.T) {
-	client := &fakeNexusClient{responses: []*workflowservice.PollNexusOperationExecutionResponse{closedWithResult(`{"allowed":true}`)}}
+	client := &fakeNexusClient{responses: []*workflowservice.PollNexusOperationExecutionResponse{closedWithResult(`{"decision":"DECISION_APPROVED"}`)}}
 	if err := newTestVerifier(client).Verify(context.Background(), testRequest()); err != nil {
 		t.Fatalf("expected allow, got %v", err)
 	}
@@ -141,7 +141,7 @@ func TestNexusVerifier_Allowed(t *testing.T) {
 }
 
 func TestNexusVerifier_InputPayload(t *testing.T) {
-	client := &fakeNexusClient{responses: []*workflowservice.PollNexusOperationExecutionResponse{closedWithResult(`{"allowed":true}`)}}
+	client := &fakeNexusClient{responses: []*workflowservice.PollNexusOperationExecutionResponse{closedWithResult(`{"decision":"DECISION_APPROVED"}`)}}
 	if err := newTestVerifier(client).Verify(context.Background(), testRequest()); err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestNexusVerifier_UnrenderableParameterDeniesWithoutRPC(t *testing.T) {
 }
 
 func TestNexusVerifier_Denied(t *testing.T) {
-	client := &fakeNexusClient{responses: []*workflowservice.PollNexusOperationExecutionResponse{closedWithResult(`{"allowed":false,"reason":"no activities"}`)}}
+	client := &fakeNexusClient{responses: []*workflowservice.PollNexusOperationExecutionResponse{closedWithResult(`{"decision":"DECISION_DENIED","reason":"no activities"}`)}}
 	err := newTestVerifier(client).Verify(context.Background(), testRequest())
 	var denied DeniedError
 	if !errors.As(err, &denied) || denied.Reason != "no activities" {
@@ -212,7 +212,7 @@ func TestNexusVerifier_Denied(t *testing.T) {
 }
 
 func TestNexusVerifier_BinaryProtoResult(t *testing.T) {
-	data, err := proto.Marshal(&toolpolicypb.VerifyToolCallsResponse{Allowed: false, Reason: "binary says no"})
+	data, err := proto.Marshal(&toolpolicypb.VerifyToolCallsResponse{Decision: toolpolicypb.Decision_DECISION_DENIED, Reason: "binary says no"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +225,7 @@ func TestNexusVerifier_BinaryProtoResult(t *testing.T) {
 }
 
 func TestNexusVerifier_DeniedWithoutReason(t *testing.T) {
-	// protojson omits false fields, so a denial from an SDK can be "{}".
+	// protojson omits zero values, so an unspecified decision is "{}".
 	client := &fakeNexusClient{responses: []*workflowservice.PollNexusOperationExecutionResponse{closedWithResult(`{}`)}}
 	err := newTestVerifier(client).Verify(context.Background(), testRequest())
 	var denied DeniedError
@@ -237,7 +237,7 @@ func TestNexusVerifier_DeniedWithoutReason(t *testing.T) {
 func TestNexusVerifier_PollsUntilClosed(t *testing.T) {
 	client := &fakeNexusClient{responses: []*workflowservice.PollNexusOperationExecutionResponse{
 		{RunId: "run-1", WaitStage: enumspb.NEXUS_OPERATION_WAIT_STAGE_STARTED},
-		closedWithResult(`{"allowed":true}`),
+		closedWithResult(`{"decision":"DECISION_APPROVED"}`),
 	}}
 	if err := newTestVerifier(client).Verify(context.Background(), testRequest()); err != nil {
 		t.Fatalf("expected allow, got %v", err)
@@ -287,4 +287,47 @@ func TestNexusVerifier_Timeout(t *testing.T) {
 	v := newTestVerifier(client)
 	v.Timeout = 20 * time.Millisecond
 	assertUnavailable(t, v.Verify(context.Background(), testRequest()))
+}
+
+func TestNexusVerifier_Decisions(t *testing.T) {
+	tests := []struct {
+		name        string
+		result      string
+		wantDenied  string // expected DeniedError reason; "" if not denied
+		unavailable bool
+	}{
+		{name: "approved", result: `{"decision":"DECISION_APPROVED"}`},
+		{name: "approved by number", result: `{"decision":1}`},
+		{name: "denied", result: `{"decision":"DECISION_DENIED","reason":"nope"}`, wantDenied: "nope"},
+		{name: "escalate", result: `{"decision":"DECISION_ESCALATE","reason":"charge over 1000"}`, wantDenied: "pending human review: charge over 1000"},
+		{name: "escalate without reason", result: `{"decision":"DECISION_ESCALATE"}`, wantDenied: "pending human review: escalated by tool verifier"},
+		{name: "retry later", result: `{"decision":"DECISION_RETRY_LATER","reason":"rate limited"}`, unavailable: true},
+		{name: "unspecified", result: `{"reason":"undecided"}`, wantDenied: "undecided"},
+		{name: "unknown enum name", result: `{"decision":"DECISION_FROM_THE_FUTURE"}`, wantDenied: "tool verifier returned no usable decision (DECISION_UNSPECIFIED)"},
+		{name: "unknown enum number", result: `{"decision":42}`, wantDenied: "tool verifier returned no usable decision (42)"},
+		// The removed bool field must not approve anything.
+		{name: "legacy allowed", result: `{"allowed":true}`, wantDenied: "tool verifier returned no usable decision (DECISION_UNSPECIFIED)"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &fakeNexusClient{responses: []*workflowservice.PollNexusOperationExecutionResponse{closedWithResult(tc.result)}}
+			err := newTestVerifier(client).Verify(context.Background(), testRequest())
+			var denied DeniedError
+			var unavailable UnavailableError
+			switch {
+			case tc.unavailable:
+				if !errors.As(err, &unavailable) {
+					t.Fatalf("expected UnavailableError, got %T: %v", err, err)
+				}
+			case tc.wantDenied != "":
+				if !errors.As(err, &denied) || denied.Reason != tc.wantDenied {
+					t.Fatalf("expected DeniedError %q, got %T: %v", tc.wantDenied, err, err)
+				}
+			default:
+				if err != nil {
+					t.Fatalf("expected approval, got %v", err)
+				}
+			}
+		})
+	}
 }

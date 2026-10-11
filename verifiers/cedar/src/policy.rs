@@ -1,34 +1,66 @@
 //! Evaluates a `VerifyToolCallsRequest` against Cedar policies.
 //!
 //! Every tool call becomes one Cedar authorization request (see
-//! `policies/schema.cedarschema` for the model); the request is allowed only
-//! if every tool call is.
+//! `policies/schema.cedarschema` for the model); the request is approved only
+//! if every tool call is allowed.
+//!
+//! A denial normally answers `DECISION_DENIED`. If every `forbid` policy that
+//! denied a call is annotated `@decision("escalate")`, the call is escalated
+//! to human review instead (`DECISION_ESCALATE`). A denied call outweighs an
+//! escalated one.
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use anyhow::{Context as _, anyhow, bail};
 use cedar_policy::{
-    Authorizer, Context, Decision, Entities, Entity, EntityId, EntityTypeName, EntityUid,
-    PolicySet, Request, RestrictedExpression, Schema, ValidationMode, Validator,
+    Authorizer, Context, Decision as CedarDecision, Entities, Entity, EntityId, EntityTypeName,
+    EntityUid, PolicySet, Request, RestrictedExpression, Schema, ValidationMode, Validator,
 };
 use serde_json::{Map, Value};
+
+/// A `toolpolicy.v1.Decision`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    Approved,
+    Denied,
+    Escalate,
+}
+
+impl Decision {
+    /// The enum value's name in the protobuf JSON mapping.
+    pub fn proto_name(self) -> &'static str {
+        match self {
+            Decision::Approved => "DECISION_APPROVED",
+            Decision::Denied => "DECISION_DENIED",
+            Decision::Escalate => "DECISION_ESCALATE",
+        }
+    }
+}
 
 /// The verdict returned to the proxy as a `VerifyToolCallsResponse`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Verdict {
-    pub allowed: bool,
+    pub decision: Decision,
     pub reason: String,
 }
 
 impl Verdict {
-    fn allow() -> Self {
+    fn approve() -> Self {
         Self {
-            allowed: true,
+            decision: Decision::Approved,
             reason: String::new(),
         }
     }
+
+    pub fn allowed(&self) -> bool {
+        self.decision == Decision::Approved
+    }
 }
+
+/// The annotation that turns a denying `forbid` policy into an escalation.
+const DECISION_ANNOTATION: &str = "decision";
+const ESCALATE: &str = "escalate";
 
 /// A loaded, optionally schema-validated, Cedar policy set.
 pub struct PolicyEngine {
@@ -110,6 +142,7 @@ impl PolicyEngine {
             None,
         )?;
 
+        let mut escalation = None;
         for (i, call) in tool_calls.iter().enumerate() {
             let call = ToolCall::parse(call).with_context(|| format!("tool call {i}"))?;
             let request = Request::new(
@@ -125,30 +158,48 @@ impl PolicyEngine {
             for error in response.diagnostics().errors() {
                 tracing::warn!(%error, tool = %call.name, "Cedar evaluation error");
             }
-            if response.decision() == Decision::Deny {
-                return Ok(Verdict {
-                    allowed: false,
-                    reason: self.deny_reason(&call.name, &response),
-                });
+            if response.decision() == CedarDecision::Allow {
+                continue;
             }
+            let verdict = self.deny_verdict(&call.name, &response);
+            if verdict.decision == Decision::Denied {
+                return Ok(verdict);
+            }
+            // Keep checking: a later denied call outweighs this escalation.
+            escalation.get_or_insert(verdict);
         }
-        Ok(Verdict::allow())
+        Ok(escalation.unwrap_or_else(Verdict::approve))
     }
 
-    fn deny_reason(&self, tool: &str, response: &cedar_policy::Response) -> String {
-        let policies: Vec<&str> = response
-            .diagnostics()
-            .reason()
+    fn deny_verdict(&self, tool: &str, response: &cedar_policy::Response) -> Verdict {
+        let determining: Vec<_> = response.diagnostics().reason().collect();
+        if determining.is_empty() {
+            return Verdict {
+                decision: Decision::Denied,
+                reason: format!("tool {tool} not permitted by any Cedar policy"),
+            };
+        }
+        let escalate = determining
+            .iter()
+            .all(|id| self.policies.annotation(id, DECISION_ANNOTATION) == Some(ESCALATE));
+        let names: Vec<&str> = determining
+            .iter()
             .map(|id| {
                 self.policies
                     .annotation(id, "id")
                     .unwrap_or_else(|| id.as_ref())
             })
             .collect();
-        if policies.is_empty() {
-            format!("tool {tool} not permitted by any Cedar policy")
+        if escalate {
+            Verdict {
+                decision: Decision::Escalate,
+                reason: format!("tool {tool} escalated by Cedar policy {}", names.join(", ")),
+            }
         } else {
-            format!("tool {tool} denied by Cedar policy {}", policies.join(", "))
+            Verdict {
+                decision: Decision::Denied,
+                reason: format!("tool {tool} denied by Cedar policy {}", names.join(", ")),
+            }
         }
     }
 }
@@ -347,17 +398,25 @@ mod tests {
 
     fn assert_allowed(tool_calls: Value) {
         let verdict = verify(tool_calls);
-        assert!(verdict.allowed, "expected allow, got {verdict:?}");
+        assert!(verdict.allowed(), "expected allow, got {verdict:?}");
     }
 
-    fn assert_denied(tool_calls: Value, reason: &str) {
+    fn assert_decision(tool_calls: Value, decision: Decision, reason: &str) {
         let verdict = verify(tool_calls);
-        assert!(!verdict.allowed, "expected deny");
+        assert_eq!(verdict.decision, decision, "verdict {verdict:?}");
         assert!(
             verdict.reason.contains(reason),
             "reason {:?} should contain {reason:?}",
             verdict.reason
         );
+    }
+
+    fn assert_denied(tool_calls: Value, reason: &str) {
+        assert_decision(tool_calls, Decision::Denied, reason);
+    }
+
+    fn assert_escalated(tool_calls: Value, reason: &str) {
+        assert_decision(tool_calls, Decision::Escalate, reason);
     }
 
     /// A google.protobuf.Value parameter, as the proxy renders json/plain input.
@@ -386,16 +445,25 @@ mod tests {
     fn charge_limits() {
         assert_allowed(charge(json!(500), "USD"));
         assert_allowed(charge(json!(1000), "EUR"));
-        assert_denied(charge(json!(5000), "USD"), "charge-limit-1000");
+        assert_escalated(
+            charge(json!(5000), "USD"),
+            "tool payments/billing/Charge escalated by Cedar policy charge-over-1000-needs-review",
+        );
+        assert_escalated(charge(json!(10000), "USD"), "charge-over-1000-needs-review");
+        // Over the hard limit both forbids apply; the plain one wins.
+        assert_denied(charge(json!(50000), "USD"), "charge-limit-10000");
         assert_denied(
             charge(json!(500), "GBP"),
             "tool payments/billing/Charge not permitted by any Cedar policy",
         );
         // A float amount can't be represented in Cedar, so it's dropped, which
         // the limit treats like a missing amount.
-        assert_denied(charge(json!(500.5), "USD"), "charge-limit-1000");
+        assert_denied(charge(json!(500.5), "USD"), "charge-limit-10000");
         // No parameters at all: the limit forbids it (forbid wins over permit).
-        assert_denied(call("payments/billing/Charge", vec![]), "charge-limit-1000");
+        assert_denied(
+            call("payments/billing/Charge", vec![]),
+            "charge-limit-10000",
+        );
     }
 
     #[test]
@@ -422,8 +490,32 @@ mod tests {
         calls
             .as_array_mut()
             .unwrap()
+            .extend(charge(json!(50000), "USD").as_array().unwrap().clone());
+        assert_denied(calls, "charge-limit-10000");
+    }
+
+    #[test]
+    fn denial_outweighs_escalation() {
+        // An escalated call followed by a denied one: the request is denied.
+        let mut calls = charge(json!(5000), "USD");
+        calls.as_array_mut().unwrap().extend(
+            call(
+                "trusted-tools/SendEmail",
+                vec![value_param(json!("a@evil.com"))],
+            )
+            .as_array()
+            .unwrap()
+            .clone(),
+        );
+        assert_denied(calls, "SendEmail not permitted");
+
+        // An escalated call next to allowed ones: the request is escalated.
+        let mut calls = call("echo/echo/Echo", vec![]);
+        calls
+            .as_array_mut()
+            .unwrap()
             .extend(charge(json!(5000), "USD").as_array().unwrap().clone());
-        assert_denied(calls, "charge-limit-1000");
+        assert_escalated(calls, "charge-over-1000-needs-review");
     }
 
     #[test]
@@ -433,7 +525,7 @@ mod tests {
             engine()
                 .verify(&json!({"caller": {"taskQueue": "queue-a"}}))
                 .unwrap()
-                .allowed
+                .allowed()
         );
     }
 
@@ -492,7 +584,7 @@ mod tests {
                 json!({"@type": "type.googleapis.com/acme.v1.Note", "text": "x"}),
             ],
         ));
-        assert!(engine.verify(&req).unwrap().allowed);
+        assert!(engine.verify(&req).unwrap().allowed());
     }
 
     #[test]
@@ -507,11 +599,11 @@ mod tests {
             engine
                 .verify(&request(call("echo/echo/Echo", vec![])))
                 .unwrap()
-                .allowed
+                .allowed()
         );
         let mut other = request(call("echo/echo/Echo", vec![]));
         other["caller"]["workflowId"] = json!("marketing-1");
-        assert!(!engine.verify(&other).unwrap().allowed);
+        assert!(!engine.verify(&other).unwrap().allowed());
     }
 
     #[test]
@@ -522,7 +614,7 @@ mod tests {
                 "tool_calls": [{"name": "echo/echo/Echo"}],
             }))
             .unwrap();
-        assert!(verdict.allowed);
+        assert!(verdict.allowed());
     }
 
     #[test]
@@ -553,9 +645,9 @@ mod tests {
             vec![value_param(json!({"orderId": "o-1", "amount": 50}))],
         ));
         req["caller"]["workflowId"] = json!("order-7");
-        assert!(engine.verify(&req).unwrap().allowed);
+        assert!(engine.verify(&req).unwrap().allowed());
         req["caller"]["workflowId"] = json!("billing-7");
-        assert!(!engine.verify(&req).unwrap().allowed);
+        assert!(!engine.verify(&req).unwrap().allowed());
     }
 
     #[test]

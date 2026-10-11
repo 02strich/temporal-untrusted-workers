@@ -59,6 +59,74 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// Decision is a verifier's verdict on a request's tool calls.
+type Decision int32
+
+const (
+	// No decision; treated as DECISION_DENIED (fail closed). Unknown future
+	// values are treated the same way.
+	Decision_DECISION_UNSPECIFIED Decision = 0
+	// The tool calls may be forwarded upstream.
+	Decision_DECISION_APPROVED Decision = 1
+	// The tool calls are not allowed. The proxy rejects the workflow task with
+	// PermissionDenied.
+	Decision_DECISION_DENIED Decision = 2
+	// The tool calls need a human's approval. The proxy currently treats this
+	// like DECISION_DENIED, with a "pending human review" reason; approving
+	// escalated calls is up to the verifier (e.g. answering DECISION_APPROVED
+	// on a later attempt).
+	Decision_DECISION_ESCALATE Decision = 3
+	// The verifier can't decide right now (rate limit, a dependency is down).
+	// The proxy rejects the workflow task with Unavailable, as if the verifier
+	// were unreachable.
+	Decision_DECISION_RETRY_LATER Decision = 4
+)
+
+// Enum value maps for Decision.
+var (
+	Decision_name = map[int32]string{
+		0: "DECISION_UNSPECIFIED",
+		1: "DECISION_APPROVED",
+		2: "DECISION_DENIED",
+		3: "DECISION_ESCALATE",
+		4: "DECISION_RETRY_LATER",
+	}
+	Decision_value = map[string]int32{
+		"DECISION_UNSPECIFIED": 0,
+		"DECISION_APPROVED":    1,
+		"DECISION_DENIED":      2,
+		"DECISION_ESCALATE":    3,
+		"DECISION_RETRY_LATER": 4,
+	}
+)
+
+func (x Decision) Enum() *Decision {
+	p := new(Decision)
+	*p = x
+	return p
+}
+
+func (x Decision) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (Decision) Descriptor() protoreflect.EnumDescriptor {
+	return file_toolpolicy_v1_toolpolicy_proto_enumTypes[0].Descriptor()
+}
+
+func (Decision) Type() protoreflect.EnumType {
+	return &file_toolpolicy_v1_toolpolicy_proto_enumTypes[0]
+}
+
+func (x Decision) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use Decision.Descriptor instead.
+func (Decision) EnumDescriptor() ([]byte, []int) {
+	return file_toolpolicy_v1_toolpolicy_proto_rawDescGZIP(), []int{0}
+}
+
 // VerifyToolCallsRequest carries the tool calls of one workflow task
 // completion (RespondWorkflowTaskCompleted).
 type VerifyToolCallsRequest struct {
@@ -245,12 +313,14 @@ func (x *ToolCall) GetParameters() []*anypb.Any {
 	return nil
 }
 
-// VerifyToolCallsResponse is the verifier's decision. The zero value denies.
+// VerifyToolCallsResponse is the verifier's decision on all tool calls of
+// the request. The zero value denies.
 type VerifyToolCallsResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Whether all tool calls may be forwarded upstream.
-	Allowed bool `protobuf:"varint,1,opt,name=allowed,proto3" json:"allowed,omitempty"`
-	// Why the tool calls were rejected; returned to the worker when allowed is false.
+	// The decision. Anything other than DECISION_APPROVED rejects the workflow
+	// task; the worker retries it on the task's normal timeout.
+	Decision Decision `protobuf:"varint,3,opt,name=decision,proto3,enum=temporal_untrusted_workers.toolpolicy.v1.Decision" json:"decision,omitempty"`
+	// Why the tool calls were not approved; returned to the worker.
 	Reason        string `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -286,11 +356,11 @@ func (*VerifyToolCallsResponse) Descriptor() ([]byte, []int) {
 	return file_toolpolicy_v1_toolpolicy_proto_rawDescGZIP(), []int{3}
 }
 
-func (x *VerifyToolCallsResponse) GetAllowed() bool {
+func (x *VerifyToolCallsResponse) GetDecision() Decision {
 	if x != nil {
-		return x.Allowed
+		return x.Decision
 	}
-	return false
+	return Decision_DECISION_UNSPECIFIED
 }
 
 func (x *VerifyToolCallsResponse) GetReason() string {
@@ -320,10 +390,16 @@ const file_toolpolicy_v1_toolpolicy_proto_rawDesc = "" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x124\n" +
 	"\n" +
 	"parameters\x18\x02 \x03(\v2\x14.google.protobuf.AnyR\n" +
-	"parameters\"K\n" +
-	"\x17VerifyToolCallsResponse\x12\x18\n" +
-	"\aallowed\x18\x01 \x01(\bR\aallowed\x12\x16\n" +
-	"\x06reason\x18\x02 \x01(\tR\x06reasonBOZMgithub.com/02strich/temporal-untrusted-workers/gen/toolpolicy/v1;toolpolicypbb\x06proto3"
+	"parameters\"\x90\x01\n" +
+	"\x17VerifyToolCallsResponse\x12N\n" +
+	"\bdecision\x18\x03 \x01(\x0e22.temporal_untrusted_workers.toolpolicy.v1.DecisionR\bdecision\x12\x16\n" +
+	"\x06reason\x18\x02 \x01(\tR\x06reasonJ\x04\b\x01\x10\x02R\aallowed*\x81\x01\n" +
+	"\bDecision\x12\x18\n" +
+	"\x14DECISION_UNSPECIFIED\x10\x00\x12\x15\n" +
+	"\x11DECISION_APPROVED\x10\x01\x12\x13\n" +
+	"\x0fDECISION_DENIED\x10\x02\x12\x15\n" +
+	"\x11DECISION_ESCALATE\x10\x03\x12\x18\n" +
+	"\x14DECISION_RETRY_LATER\x10\x04BOZMgithub.com/02strich/temporal-untrusted-workers/gen/toolpolicy/v1;toolpolicypbb\x06proto3"
 
 var (
 	file_toolpolicy_v1_toolpolicy_proto_rawDescOnce sync.Once
@@ -337,23 +413,26 @@ func file_toolpolicy_v1_toolpolicy_proto_rawDescGZIP() []byte {
 	return file_toolpolicy_v1_toolpolicy_proto_rawDescData
 }
 
+var file_toolpolicy_v1_toolpolicy_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
 var file_toolpolicy_v1_toolpolicy_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
 var file_toolpolicy_v1_toolpolicy_proto_goTypes = []any{
-	(*VerifyToolCallsRequest)(nil),  // 0: temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsRequest
-	(*Caller)(nil),                  // 1: temporal_untrusted_workers.toolpolicy.v1.Caller
-	(*ToolCall)(nil),                // 2: temporal_untrusted_workers.toolpolicy.v1.ToolCall
-	(*VerifyToolCallsResponse)(nil), // 3: temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsResponse
-	(*anypb.Any)(nil),               // 4: google.protobuf.Any
+	(Decision)(0),                   // 0: temporal_untrusted_workers.toolpolicy.v1.Decision
+	(*VerifyToolCallsRequest)(nil),  // 1: temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsRequest
+	(*Caller)(nil),                  // 2: temporal_untrusted_workers.toolpolicy.v1.Caller
+	(*ToolCall)(nil),                // 3: temporal_untrusted_workers.toolpolicy.v1.ToolCall
+	(*VerifyToolCallsResponse)(nil), // 4: temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsResponse
+	(*anypb.Any)(nil),               // 5: google.protobuf.Any
 }
 var file_toolpolicy_v1_toolpolicy_proto_depIdxs = []int32{
-	1, // 0: temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsRequest.caller:type_name -> temporal_untrusted_workers.toolpolicy.v1.Caller
-	2, // 1: temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsRequest.tool_calls:type_name -> temporal_untrusted_workers.toolpolicy.v1.ToolCall
-	4, // 2: temporal_untrusted_workers.toolpolicy.v1.ToolCall.parameters:type_name -> google.protobuf.Any
-	3, // [3:3] is the sub-list for method output_type
-	3, // [3:3] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	2, // 0: temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsRequest.caller:type_name -> temporal_untrusted_workers.toolpolicy.v1.Caller
+	3, // 1: temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsRequest.tool_calls:type_name -> temporal_untrusted_workers.toolpolicy.v1.ToolCall
+	5, // 2: temporal_untrusted_workers.toolpolicy.v1.ToolCall.parameters:type_name -> google.protobuf.Any
+	0, // 3: temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsResponse.decision:type_name -> temporal_untrusted_workers.toolpolicy.v1.Decision
+	4, // [4:4] is the sub-list for method output_type
+	4, // [4:4] is the sub-list for method input_type
+	4, // [4:4] is the sub-list for extension type_name
+	4, // [4:4] is the sub-list for extension extendee
+	0, // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_toolpolicy_v1_toolpolicy_proto_init() }
@@ -366,13 +445,14 @@ func file_toolpolicy_v1_toolpolicy_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_toolpolicy_v1_toolpolicy_proto_rawDesc), len(file_toolpolicy_v1_toolpolicy_proto_rawDesc)),
-			NumEnums:      0,
+			NumEnums:      1,
 			NumMessages:   4,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
 		GoTypes:           file_toolpolicy_v1_toolpolicy_proto_goTypes,
 		DependencyIndexes: file_toolpolicy_v1_toolpolicy_proto_depIdxs,
+		EnumInfos:         file_toolpolicy_v1_toolpolicy_proto_enumTypes,
 		MessageInfos:      file_toolpolicy_v1_toolpolicy_proto_msgTypes,
 	}.Build()
 	File_toolpolicy_v1_toolpolicy_proto = out.File
