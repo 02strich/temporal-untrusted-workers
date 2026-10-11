@@ -14,6 +14,7 @@ import (
 	"fmt"
 
 	"github.com/02strich/temporal-untrusted-workers/internal/auth"
+	"github.com/02strich/temporal-untrusted-workers/internal/inputevents"
 )
 
 // Kind is the kind of command a tool call was translated from.
@@ -46,17 +47,30 @@ type Call struct {
 	Err error
 }
 
+// Caller identifies the workflow run a workflow task belongs to and the
+// worker identity processing it.
+type Caller struct {
+	// Identity is the authenticated worker.
+	Identity auth.Identity
+	// TaskQueue is the task queue that issued the workflow task token -
+	// always one of Identity.TaskQueues.
+	TaskQueue string
+	// WorkflowID and RunID identify the workflow run.
+	WorkflowID string
+	RunID      string
+}
+
 // Request describes the tool calls of one RespondWorkflowTaskCompleted call.
 type Request struct {
-	// Identity is the authenticated caller.
-	Identity auth.Identity
-	// TaskQueue is the task queue that issued the workflow task token being
-	// completed - always one of Identity.TaskQueues.
-	TaskQueue string
-	// WorkflowID is the workflow whose task is being completed.
-	WorkflowID string
+	Caller
 	// Calls are the tool calls, in command order.
 	Calls []Call
+}
+
+// InputRecorder records the context a workflow run receives (input events)
+// with the tool verifier, before the worker sees it.
+type InputRecorder interface {
+	RecordInputEvents(ctx context.Context, caller Caller, batch inputevents.Batch) error
 }
 
 // Verifier decides whether a set of tool calls may be forwarded.

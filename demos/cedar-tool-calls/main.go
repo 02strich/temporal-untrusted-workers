@@ -37,12 +37,34 @@ var cases = map[string]string{
 	"charge-ok":   `Nexus     payments/billing/Charge({amount: 500, currency: "USD"})`,
 	"charge-big":  `Nexus     payments/billing/Charge({amount: 5000, currency: "USD"})`,
 	"charge-huge": `Nexus     payments/billing/Charge({amount: 50000, currency: "USD"})`,
-	"email-ok":    `Activity  trusted-tools/SendEmail("alice@example.com")`,
-	"email-bad":   `Activity  trusted-tools/SendEmail("mallory@evil.com")`,
+	"email-ok":    `Activity  trusted-tools/SendEmail("alice@example.com")   (the customer's address)`,
+	"email-bad":   `Activity  trusted-tools/SendEmail("mallory@evil.com")    (never given to the workflow)`,
 	"child-cross": `Child     workflow on task queue "other-queue"`,
+	"refund-approved": `Signal    approval({refundId: "R-1001", approvedBy: "manager@example.com"})
+  then    Activity  trusted-tools/IssueRefund("R-1001")`,
+	"refund-unapproved": `Activity  trusted-tools/IssueRefund("R-1001")   (no approval signal)`,
 }
 
-func ToolWorkflow(ctx workflow.Context, kase string) (string, error) {
+// Input is the workflow's start input. CustomerEmail plays the customer's
+// input to an agent: the Cedar policy only lets SendEmail reach addresses the
+// workflow actually received.
+type Input struct {
+	Case          string `json:"case"`
+	CustomerEmail string `json:"customerEmail"`
+	// RefundID is the refund the customer asked for.
+	RefundID string `json:"refundId"`
+}
+
+// Approval is the payload of the "approval" signal a human sends to approve a
+// refund. The Cedar policy only allows IssueRefund for a refund an approval
+// signal named.
+type Approval struct {
+	RefundID   string `json:"refundId"`
+	ApprovedBy string `json:"approvedBy"`
+}
+
+func ToolWorkflow(ctx workflow.Context, in Input) (string, error) {
+	kase := in.Case
 	nexusOpts := workflow.NexusOperationOptions{ScheduleToCloseTimeout: time.Minute}
 	var out string
 	switch kase {
@@ -54,8 +76,9 @@ func ToolWorkflow(ctx workflow.Context, kase string) (string, error) {
 		err := workflow.NewNexusClient("payments", "billing").ExecuteOperation(ctx, "Charge", Charge{Amount: amount, Currency: "USD"}, nexusOpts).Get(ctx, &out)
 		return out, err
 	case "email-ok", "email-bad":
-		to := "alice@example.com"
+		to := in.CustomerEmail
 		if kase == "email-bad" {
+			// As if a prompt injection steered the agent elsewhere.
 			to = "mallory@evil.com"
 		}
 		actx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{TaskQueue: "trusted-tools", StartToCloseTimeout: time.Minute})
@@ -64,6 +87,17 @@ func ToolWorkflow(ctx workflow.Context, kase string) (string, error) {
 	case "child-cross":
 		cctx := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{TaskQueue: "other-queue"})
 		err := workflow.ExecuteChildWorkflow(cctx, "Whatever").Get(ctx, &out)
+		return out, err
+	case "refund-approved", "refund-unapproved":
+		if kase == "refund-approved" {
+			// Wait for a human's approval before refunding.
+			var approval Approval
+			workflow.GetSignalChannel(ctx, "approval").Receive(ctx, &approval)
+		}
+		// "refund-unapproved" refunds right away, as an agent might without
+		// waiting for anyone.
+		actx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{TaskQueue: "trusted-tools", StartToCloseTimeout: time.Minute})
+		err := workflow.ExecuteActivity(actx, "IssueRefund", in.RefundID).Get(ctx, &out)
 		return out, err
 	}
 	return "", fmt.Errorf("unknown case %q", kase)
@@ -87,6 +121,9 @@ func handlers(addr string) {
 	aw.RegisterActivityWithOptions(func(ctx context.Context, to string) (string, error) {
 		return "email sent to " + to, nil
 	}, activity.RegisterOptions{Name: "SendEmail"})
+	aw.RegisterActivityWithOptions(func(ctx context.Context, refundID string) (string, error) {
+		return "refunded " + refundID, nil
+	}, activity.RegisterOptions{Name: "IssueRefund"})
 	must(aw.Start())
 	<-worker.InterruptCh()
 	nw.Stop()
@@ -100,17 +137,23 @@ func untrusted(proxyAddr string) {
 	must(w.Run(worker.InterruptCh()))
 }
 
-func run(addr, proxyLog string, kases []string) {
+func run(addr string, logs demokit.Logs, kases []string) {
 	c := demokit.Dial(client.Options{HostPort: addr})
 	for _, kase := range kases {
 		title, ok := cases[kase]
 		if !ok {
 			log.Fatalf("unknown case %q", kase)
 		}
-		demokit.RunCase(c, proxyLog, fmt.Sprintf("demo-%s-%d", kase, time.Now().UnixNano()), demokit.Case{
+		demokit.RunCase(c, logs, fmt.Sprintf("demo-%s-%d", kase, time.Now().UnixNano()), demokit.Case{
 			Title: title,
 			Start: func(ctx context.Context, c client.Client, id string) (client.WorkflowRun, error) {
-				return c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: id, TaskQueue: "proxy-test-queue"}, ToolWorkflow, kase)
+				in := Input{Case: kase, CustomerEmail: "alice@example.com", RefundID: "R-1001"}
+				run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: id, TaskQueue: "proxy-test-queue"}, ToolWorkflow, in)
+				if err != nil || kase != "refund-approved" {
+					return run, err
+				}
+				// A manager approves the refund from outside the workflow.
+				return run, c.SignalWorkflow(ctx, id, "", "approval", Approval{RefundID: "R-1001", ApprovedBy: "manager@example.com"})
 			},
 		})
 	}
@@ -130,6 +173,6 @@ func main() {
 	case "untrusted":
 		untrusted(os.Getenv("PROXY_ADDRESS"))
 	case "run":
-		run(addr, os.Getenv("PROXY_LOG"), os.Args[2:])
+		run(addr, demokit.Logs{Proxy: os.Getenv("PROXY_LOG"), Verifier: os.Getenv("VERIFIER_LOG")}, os.Args[2:])
 	}
 }

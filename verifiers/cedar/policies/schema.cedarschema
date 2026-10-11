@@ -6,11 +6,18 @@
 //   action:    the tool, Action::"<endpoint>/<service>/<operation>" or
 //              Action::"<taskQueue>/<activityType>"
 //   resource:  the task queue that issued the workflow task token
-//   context:   the calling workflow's ID and the tool call's parameters
+//   context:   the calling workflow's ID, the tool call's parameters, and the
+//              context the workflow has received:
+//                workflowInput  its start input: {name, parameters}
+//                events         the latest activity result, Nexus result,
+//                               signal and update of each name:
+//                               events.<type>["<name>"] = {type, name, count, parameters}
 //
-// Each tool is its own action, so it declares the shape of its parameters
-// below. A tool that isn't declared here can't be used in a validated policy,
-// and Cedar's default deny rejects it.
+// Parameters always have the same shape: {arg0: {type, data}, arg1: …}, where
+// data is the payload's content. Each tool is its own action and declares its
+// parameters below; workflow inputs and events declare theirs in
+// WorkflowInput and Events. Anything a policy uses must be declared here, and
+// Cedar's default deny rejects tools no policy permits.
 
 // The calling worker identity, keyed by its subject.
 entity Worker = {
@@ -22,6 +29,47 @@ entity Worker = {
 entity TaskQueue = {
   name: String,
   namespace: String,
+};
+
+// The workflow's start input (the demo's ToolWorkflow takes one JSON object).
+type WorkflowInput = {
+  name: String,
+  parameters: {
+    arg0?: {
+      type: String,
+      data: {
+        case?: String,
+        customerEmail?: String,
+        refundId?: String,
+      },
+    },
+  },
+};
+
+// The latest input event of each name, by type. Declare the names (and
+// their parameters) your policies use; activity and Nexus names contain "/",
+// so quote them, e.g. "crm/LookupCustomer"?: {...}.
+type Events = {
+  activity: {},
+  nexus: {},
+  signal: {
+    // An approval, e.g. {"refundId": "R-1001", "approvedBy": "manager@example.com"}.
+    approval?: {
+      type: String,
+      name: String,
+      count: Long,
+      parameters: {
+        arg0?: {
+          type: String,
+          data: {
+            refundId?: String,
+            approvedBy?: String,
+          },
+        },
+      },
+    },
+  },
+  update: {},
 };
 
 // Parameters of a tool taking a single plain JSON string
@@ -51,6 +99,9 @@ action "echo/echo/Echo" appliesTo {
     workflowId: String,
     parameterCount: Long,
     parameters: StringArgument,
+    workflowInput: WorkflowInput,
+    events: Events,
+    inputEventsComplete: Bool,
   },
 };
 
@@ -61,6 +112,9 @@ action "payments/billing/Charge" appliesTo {
     workflowId: String,
     parameterCount: Long,
     parameters: ChargeArguments,
+    workflowInput: WorkflowInput,
+    events: Events,
+    inputEventsComplete: Bool,
   },
 };
 
@@ -71,5 +125,21 @@ action "trusted-tools/SendEmail" appliesTo {
     workflowId: String,
     parameterCount: Long,
     parameters: StringArgument,
+    workflowInput: WorkflowInput,
+    events: Events,
+    inputEventsComplete: Bool,
+  },
+};
+
+action "trusted-tools/IssueRefund" appliesTo {
+  principal: Worker,
+  resource: TaskQueue,
+  context: {
+    workflowId: String,
+    parameterCount: Long,
+    parameters: StringArgument,
+    workflowInput: WorkflowInput,
+    events: Events,
+    inputEventsComplete: Bool,
   },
 };

@@ -9,7 +9,7 @@
 //! to human review instead (`DECISION_ESCALATE`). A denied call outweighs an
 //! escalated one.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 
 use anyhow::{Context as _, anyhow, bail};
@@ -58,6 +58,31 @@ impl Verdict {
     }
 }
 
+/// One recorded input event: its name, how many events of that type and
+/// name the run received, and the latest one's payloads (protobuf JSON Anys).
+#[derive(Debug, Default, Clone)]
+pub struct RecordedEvent {
+    pub name: String,
+    pub count: u64,
+    pub payloads: Vec<Value>,
+}
+
+/// The context a workflow run has received, as the policies see it:
+/// `context.workflowInput`, `context.events` and `context.inputEventsComplete`.
+#[derive(Debug, Default, Clone)]
+pub struct InputContext {
+    /// The workflow's start input, if recorded.
+    pub workflow_input: Option<RecordedEvent>,
+    /// The latest event of each name, by type (activity, nexus, signal,
+    /// update).
+    pub events: BTreeMap<String, BTreeMap<String, RecordedEvent>>,
+    /// Whether the verifier has the run's context from its start.
+    pub complete: bool,
+}
+
+/// The event types in `context.events`; each is always present.
+const EVENT_TYPES: [&str; 4] = ["activity", "nexus", "signal", "update"];
+
 /// The annotation that turns a denying `forbid` policy into an escalation.
 const DECISION_ANNOTATION: &str = "decision";
 const ESCALATE: &str = "escalate";
@@ -100,7 +125,7 @@ impl PolicyEngine {
 
     /// Decides a `VerifyToolCallsRequest`, given in the protobuf JSON mapping.
     /// Errors mean the input could not be interpreted.
-    pub fn verify(&self, request: &Value) -> anyhow::Result<Verdict> {
+    pub fn verify(&self, request: &Value, inputs: &InputContext) -> anyhow::Result<Verdict> {
         let caller = field(request, "caller", "caller").unwrap_or(&Value::Null);
         let namespace = string_field(caller, "namespace", "namespace");
         let subject = string_field(caller, "subject", "subject");
@@ -145,11 +170,12 @@ impl PolicyEngine {
         let mut escalation = None;
         for (i, call) in tool_calls.iter().enumerate() {
             let call = ToolCall::parse(call).with_context(|| format!("tool call {i}"))?;
+            let (context, context_json) = call.context(&workflow_id, inputs)?;
             let request = Request::new(
                 principal.clone(),
                 uid("Action", &call.name)?,
                 resource.clone(),
-                call.context(&workflow_id)?,
+                context,
                 None,
             )?;
             let response = self
@@ -157,6 +183,35 @@ impl PolicyEngine {
                 .is_authorized(&request, &self.policies, &entities);
             for error in response.diagnostics().errors() {
                 tracing::warn!(%error, tool = %call.name, "Cedar evaluation error");
+            }
+            // One JSON line per evaluation, for showing what a policy saw
+            // (e.g. in the demo): RUST_LOG=cedar_request=debug.
+            if tracing::enabled!(target: "cedar_request", tracing::Level::DEBUG) {
+                let decision = if response.decision() == CedarDecision::Allow {
+                    "allow"
+                } else {
+                    "deny"
+                };
+                // The policies that determined the decision, by @id.
+                let policies: Vec<&str> = response
+                    .diagnostics()
+                    .reason()
+                    .map(|id| {
+                        self.policies
+                            .annotation(id, "id")
+                            .unwrap_or_else(|| id.as_ref())
+                    })
+                    .collect();
+                let line = serde_json::json!({
+                    "workflowId": workflow_id,
+                    "principal": principal.to_string(),
+                    "action": uid("Action", &call.name)?.to_string(),
+                    "resource": resource.to_string(),
+                    "context": context_json,
+                    "decision": decision,
+                    "policies": policies,
+                });
+                tracing::debug!(target: "cedar_request", "{line}");
             }
             if response.decision() == CedarDecision::Allow {
                 continue;
@@ -216,6 +271,8 @@ struct ToolCall {
 struct Parameter {
     type_name: String,
     data: Vec<(String, RestrictedExpression)>,
+    /// `data` as JSON, for logging what Cedar evaluated.
+    data_json: Map<String, Value>,
 }
 
 impl ToolCall {
@@ -236,22 +293,38 @@ impl ToolCall {
         Ok(Self { name, parameters })
     }
 
-    fn context(&self, workflow_id: &str) -> anyhow::Result<Context> {
-        let mut parameters = Vec::with_capacity(self.parameters.len());
-        for (i, param) in self.parameters.iter().enumerate() {
-            let record = RestrictedExpression::new_record([
-                (
-                    "type".to_owned(),
-                    RestrictedExpression::new_string(param.type_name.clone()),
-                ),
-                (
-                    "data".to_owned(),
-                    RestrictedExpression::new_record(param.data.clone())?,
-                ),
-            ])?;
-            parameters.push((format!("arg{i}"), record));
+    /// The Cedar context, and the same as JSON (for logging what Cedar
+    /// evaluated).
+    fn context(
+        &self,
+        workflow_id: &str,
+        inputs: &InputContext,
+    ) -> anyhow::Result<(Context, Value)> {
+        let (parameters, parameters_json) = parameters_record(&self.parameters)?;
+
+        let (workflow_input, workflow_input_json) = match &inputs.workflow_input {
+            Some(input) => event_record(None, input)?,
+            None => event_record(None, &RecordedEvent::default())?,
+        };
+
+        let mut events = Vec::with_capacity(EVENT_TYPES.len());
+        let mut events_json = Map::new();
+        for event_type in EVENT_TYPES {
+            let mut by_name = Vec::new();
+            let mut by_name_json = Map::new();
+            for (name, event) in inputs.events.get(event_type).into_iter().flatten() {
+                let (record, json) = event_record(Some(event_type), event)?;
+                by_name.push((name.clone(), record));
+                by_name_json.insert(name.clone(), json);
+            }
+            events.push((
+                event_type.to_owned(),
+                RestrictedExpression::new_record(by_name)?,
+            ));
+            events_json.insert(event_type.to_owned(), Value::Object(by_name_json));
         }
-        Ok(Context::from_pairs([
+
+        let context = Context::from_pairs([
             (
                 "workflowId".to_owned(),
                 RestrictedExpression::new_string(workflow_id.to_owned()),
@@ -260,12 +333,96 @@ impl ToolCall {
                 "parameterCount".to_owned(),
                 RestrictedExpression::new_long(self.parameters.len() as i64),
             ),
+            ("parameters".to_owned(), parameters),
+            ("workflowInput".to_owned(), workflow_input),
             (
-                "parameters".to_owned(),
-                RestrictedExpression::new_record(parameters)?,
+                "events".to_owned(),
+                RestrictedExpression::new_record(events)?,
             ),
-        ])?)
+            (
+                "inputEventsComplete".to_owned(),
+                RestrictedExpression::new_bool(inputs.complete),
+            ),
+        ])?;
+        let json = serde_json::json!({
+            "workflowId": workflow_id,
+            "parameterCount": self.parameters.len(),
+            "parameters": parameters_json,
+            "workflowInput": workflow_input_json,
+            "events": events_json,
+            "inputEventsComplete": inputs.complete,
+        });
+        Ok((context, json))
     }
+}
+
+/// `{arg0: {type, data}, arg1: …}` for a list of parameters (a tool call's,
+/// or an input event's payloads), as a Cedar record and as JSON.
+fn parameters_record(parameters: &[Parameter]) -> anyhow::Result<(RestrictedExpression, Value)> {
+    let mut record = Vec::with_capacity(parameters.len());
+    let mut json = Map::new();
+    for (i, param) in parameters.iter().enumerate() {
+        record.push((
+            format!("arg{i}"),
+            RestrictedExpression::new_record([
+                (
+                    "type".to_owned(),
+                    RestrictedExpression::new_string(param.type_name.clone()),
+                ),
+                (
+                    "data".to_owned(),
+                    RestrictedExpression::new_record(param.data.clone())?,
+                ),
+            ])?,
+        ));
+        json.insert(
+            format!("arg{i}"),
+            serde_json::json!({"type": param.type_name, "data": param.data_json}),
+        );
+    }
+    Ok((
+        RestrictedExpression::new_record(record)?,
+        Value::Object(json),
+    ))
+}
+
+/// An input event entry: `{type, name, count, parameters}` for events, or
+/// `{name, parameters}` for the workflow input (`event_type` None).
+fn event_record(
+    event_type: Option<&str>,
+    event: &RecordedEvent,
+) -> anyhow::Result<(RestrictedExpression, Value)> {
+    let parameters = event
+        .payloads
+        .iter()
+        .map(Parameter::parse)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let (parameters, parameters_json) = parameters_record(&parameters)?;
+    let mut fields = vec![
+        (
+            "name".to_owned(),
+            RestrictedExpression::new_string(event.name.clone()),
+        ),
+        ("parameters".to_owned(), parameters),
+    ];
+    let mut json = serde_json::json!({"name": event.name, "parameters": parameters_json});
+    if let Some(event_type) = event_type {
+        fields.push((
+            "type".to_owned(),
+            RestrictedExpression::new_string(event_type.to_owned()),
+        ));
+        fields.push((
+            "count".to_owned(),
+            RestrictedExpression::new_long(event.count as i64),
+        ));
+        json = serde_json::json!({
+            "type": event_type,
+            "name": event.name,
+            "count": event.count,
+            "parameters": parameters_json,
+        });
+    }
+    Ok((RestrictedExpression::new_record(fields)?, json))
 }
 
 /// Well-known types whose protobuf JSON form is not a plain object of fields;
@@ -292,34 +449,61 @@ const VALUE_FORM_TYPES: &[&str] = &[
 /// The proxy packs payloads it can't interpret (e.g. encrypted ones) as-is.
 const OPAQUE_PAYLOAD_TYPE: &str = "temporal.api.common.v1.Payload";
 
+/// The content of a google.protobuf.Any in protobuf JSON form.
+pub(crate) enum AnyData {
+    /// A payload the proxy couldn't interpret.
+    Opaque,
+    /// A well-known type in "value" form: the Any's `value`.
+    Value(Value),
+    /// A message type: its fields.
+    Fields(Map<String, Value>),
+}
+
+/// Splits the protobuf JSON form of a google.protobuf.Any into its type name
+/// (without the `type.googleapis.com/` prefix) and its content.
+pub(crate) fn parse_any(any: &Value) -> anyhow::Result<(String, AnyData)> {
+    let Some(object) = any.as_object() else {
+        bail!("expected a JSON object (a google.protobuf.Any)");
+    };
+    let type_url = object
+        .get("@type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("Any has no \"@type\""))?;
+    let type_name = type_url.rsplit('/').next().unwrap_or(type_url).to_owned();
+
+    let data = if type_name == OPAQUE_PAYLOAD_TYPE {
+        AnyData::Opaque
+    } else if VALUE_FORM_TYPES.contains(&type_name.as_str()) {
+        AnyData::Value(object.get("value").cloned().unwrap_or(Value::Null))
+    } else {
+        let mut fields = object.clone();
+        fields.remove("@type");
+        AnyData::Fields(fields)
+    };
+    Ok((type_name, data))
+}
+
 impl Parameter {
     /// Interprets the protobuf JSON form of a google.protobuf.Any.
     fn parse(any: &Value) -> anyhow::Result<Self> {
-        let Some(object) = any.as_object() else {
-            bail!("parameter must be a JSON object (a google.protobuf.Any)");
+        let (type_name, data) = parse_any(any)?;
+        // Keep only what Cedar can represent, so the logged JSON matches the
+        // record the policies see.
+        let data_json: Map<String, Value> = match data {
+            AnyData::Opaque => Map::new(),
+            AnyData::Value(Value::Object(fields)) | AnyData::Fields(fields) => fields
+                .iter()
+                .filter_map(|(k, v)| cedar_json(v).map(|v| (k.clone(), v)))
+                .collect(),
+            AnyData::Value(value) => cedar_json(&value)
+                .map(|v| Map::from_iter([("value".to_owned(), v)]))
+                .unwrap_or_default(),
         };
-        let type_url = object
-            .get("@type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("parameter has no \"@type\""))?;
-        let type_name = type_url.rsplit('/').next().unwrap_or(type_url).to_owned();
-
-        let data = if type_name == OPAQUE_PAYLOAD_TYPE {
-            Vec::new()
-        } else if VALUE_FORM_TYPES.contains(&type_name.as_str()) {
-            match object.get("value") {
-                Some(Value::Object(fields)) => record_fields(fields),
-                Some(value) => to_cedar(value)
-                    .map(|v| vec![("value".to_owned(), v)])
-                    .unwrap_or_default(),
-                None => Vec::new(),
-            }
-        } else {
-            let mut fields = object.clone();
-            fields.remove("@type");
-            record_fields(&fields)
-        };
-        Ok(Self { type_name, data })
+        Ok(Self {
+            type_name,
+            data: record_fields(&data_json),
+            data_json,
+        })
     }
 }
 
@@ -330,6 +514,22 @@ fn record_fields(fields: &Map<String, Value>) -> Vec<(String, RestrictedExpressi
         .iter()
         .filter_map(|(k, v)| to_cedar(v).map(|v| (k.clone(), v)))
         .collect()
+}
+
+/// The part of a JSON value Cedar can represent (see to_cedar), as JSON.
+fn cedar_json(value: &Value) -> Option<Value> {
+    match value {
+        Value::Null => None,
+        Value::Number(n) => n.as_i64().map(Value::from),
+        Value::Array(items) => Some(Value::Array(items.iter().filter_map(cedar_json).collect())),
+        Value::Object(fields) => Some(Value::Object(
+            fields
+                .iter()
+                .filter_map(|(k, v)| cedar_json(v).map(|v| (k.clone(), v)))
+                .collect(),
+        )),
+        Value::Bool(_) | Value::String(_) => Some(value.clone()),
+    }
 }
 
 /// Converts a JSON value to a Cedar value. Floats and nulls have no Cedar
@@ -372,6 +572,13 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    impl PolicyEngine {
+        /// verify for a run the verifier has no input events for.
+        fn verify_no_inputs(&self, request: &Value) -> anyhow::Result<Verdict> {
+            self.verify(request, &InputContext::default())
+        }
+    }
+
     const EXAMPLE_POLICY: &str = include_str!("../policies/example.cedar");
     const SCHEMA: &str = include_str!("../policies/schema.cedarschema");
 
@@ -393,7 +600,9 @@ mod tests {
     }
 
     fn verify(tool_calls: Value) -> Verdict {
-        engine().verify(&request(tool_calls)).expect("valid input")
+        engine()
+            .verify_no_inputs(&request(tool_calls))
+            .expect("valid input")
     }
 
     fn assert_allowed(tool_calls: Value) {
@@ -467,13 +676,6 @@ mod tests {
     }
 
     #[test]
-    fn send_email_domain() {
-        let send = |to: &str| call("trusted-tools/SendEmail", vec![value_param(json!(to))]);
-        assert_allowed(send("a@example.com"));
-        assert_denied(send("a@evil.com"), "not permitted");
-    }
-
-    #[test]
     fn undeclared_tool_is_denied() {
         assert_denied(
             call(
@@ -523,7 +725,7 @@ mod tests {
         assert_allowed(json!([]));
         assert!(
             engine()
-                .verify(&json!({"caller": {"taskQueue": "queue-a"}}))
+                .verify_no_inputs(&json!({"caller": {"taskQueue": "queue-a"}}))
                 .unwrap()
                 .allowed()
         );
@@ -584,7 +786,187 @@ mod tests {
                 json!({"@type": "type.googleapis.com/acme.v1.Note", "text": "x"}),
             ],
         ));
-        assert!(engine.verify(&req).unwrap().allowed());
+        assert!(engine.verify_no_inputs(&req).unwrap().allowed());
+    }
+
+    /// A protobuf JSON Any of a google.protobuf.Value, as the proxy sends
+    /// json/plain payloads.
+    fn value_any(value: Value) -> Value {
+        json!({"@type": "type.googleapis.com/google.protobuf.Value", "value": value})
+    }
+
+    fn recorded(name: &str, count: u64, data: Value) -> RecordedEvent {
+        RecordedEvent {
+            name: name.to_owned(),
+            count,
+            payloads: vec![value_any(data)],
+        }
+    }
+
+    fn started_with(input: Value) -> InputContext {
+        InputContext {
+            workflow_input: Some(recorded("ToolWorkflow", 1, input)),
+            complete: true,
+            ..Default::default()
+        }
+    }
+
+    fn with_signal(mut inputs: InputContext, name: &str, count: u64, data: Value) -> InputContext {
+        inputs
+            .events
+            .entry("signal".to_owned())
+            .or_default()
+            .insert(name.to_owned(), recorded(name, count, data));
+        inputs
+    }
+
+    #[test]
+    fn send_email_only_to_the_customer() {
+        let send = |to: &str| {
+            request(call(
+                "trusted-tools/SendEmail",
+                vec![value_param(json!(to))],
+            ))
+        };
+        let mut inputs =
+            started_with(json!({"case": "email", "customerEmail": "alice@example.com"}));
+        let e = engine();
+        let allowed = e.verify(&send("alice@example.com"), &inputs).unwrap();
+        assert!(allowed.allowed(), "{allowed:?}");
+        let denied = e.verify(&send("mallory@evil.com"), &inputs).unwrap();
+        assert_eq!(denied.decision, Decision::Denied);
+        assert!(denied.reason.contains("not permitted"));
+
+        // Without the run's full context the address can't be vouched for.
+        inputs.complete = false;
+        assert!(
+            !e.verify(&send("alice@example.com"), &inputs)
+                .unwrap()
+                .allowed()
+        );
+        assert!(
+            !e.verify_no_inputs(&send("alice@example.com"))
+                .unwrap()
+                .allowed()
+        );
+    }
+
+    #[test]
+    fn refund_needs_matching_approval_signal() {
+        let refund = |id: &str| {
+            request(call(
+                "trusted-tools/IssueRefund",
+                vec![value_param(json!(id))],
+            ))
+        };
+        let started = started_with(json!({"refundId": "R-1001"}));
+        let approved = with_signal(
+            started.clone(),
+            "approval",
+            1,
+            json!({"refundId": "R-1001", "approvedBy": "manager@example.com"}),
+        );
+        let e = engine();
+        let verdict = e.verify(&refund("R-1001"), &approved).unwrap();
+        assert!(verdict.allowed(), "{verdict:?}");
+        // An approval names a specific refund.
+        assert!(!e.verify(&refund("R-9999"), &approved).unwrap().allowed());
+        // The refund ID in the workflow input isn't an approval.
+        assert!(!e.verify(&refund("R-1001"), &started).unwrap().allowed());
+        // Policies see the latest approval signal.
+        let reapproved = with_signal(approved, "approval", 2, json!({"refundId": "R-2002"}));
+        assert!(!e.verify(&refund("R-1001"), &reapproved).unwrap().allowed());
+        assert!(e.verify(&refund("R-2002"), &reapproved).unwrap().allowed());
+    }
+
+    #[test]
+    fn events_by_type_and_name() {
+        // Activity and Nexus names contain "/", so policies quote them.
+        let schema = SCHEMA.replace(
+            "  activity: {},",
+            r#"  activity: { "crm/LookupCustomer"?: { type: String, name: String, count: Long,
+                 parameters: { arg0?: { type: String, data: { email?: String } } } } },"#,
+        );
+        let policies = r#"
+            @id("email-crm-contact")
+            permit (principal, action == Action::"trusted-tools/SendEmail", resource)
+            when {
+              context.events.activity has "crm/LookupCustomer" &&
+              context.events.activity["crm/LookupCustomer"].count >= 1 &&
+              context.events.activity["crm/LookupCustomer"].parameters has arg0 &&
+              context.events.activity["crm/LookupCustomer"].parameters.arg0.data has email &&
+              context.parameters has arg0 && context.parameters.arg0.data has value &&
+              context.parameters.arg0.data.value == context.events.activity["crm/LookupCustomer"].parameters.arg0.data.email
+            };
+        "#;
+        let engine = PolicyEngine::new(policies, Some(&schema)).expect("validates against schema");
+        let send = |to: &str| {
+            request(call(
+                "trusted-tools/SendEmail",
+                vec![value_param(json!(to))],
+            ))
+        };
+        let mut inputs = InputContext::default();
+        inputs.events.entry("activity".to_owned()).or_default().insert(
+            "crm/LookupCustomer".to_owned(),
+            RecordedEvent {
+                name: "crm/LookupCustomer".to_owned(),
+                count: 1,
+                payloads: vec![json!({"@type": "type.googleapis.com/acme.v1.Customer", "email": "bob@example.com"})],
+            },
+        );
+        assert!(
+            engine
+                .verify(&send("bob@example.com"), &inputs)
+                .unwrap()
+                .allowed()
+        );
+        assert!(
+            !engine
+                .verify(&send("eve@example.com"), &inputs)
+                .unwrap()
+                .allowed()
+        );
+    }
+
+    #[test]
+    fn context_json_matches_what_cedar_sees() {
+        let call = ToolCall::parse(&json!({
+            "name": "payments/billing/Charge",
+            "parameters": [value_param(json!({"amount": 500, "currency": "USD", "ratio": 0.5, "note": null}))],
+        }))
+        .unwrap();
+        let inputs = with_signal(
+            started_with(json!({"customerEmail": "alice@example.com"})),
+            "approval",
+            2,
+            json!({"refundId": "R-1001"}),
+        );
+        let (_, json) = call.context("wf-1", &inputs).unwrap();
+        assert_eq!(
+            json,
+            json!({
+                "workflowId": "wf-1",
+                "parameterCount": 1,
+                "parameters": {"arg0": {"type": "google.protobuf.Value", "data": {"amount": 500, "currency": "USD"}}},
+                "workflowInput": {
+                    "name": "ToolWorkflow",
+                    "parameters": {"arg0": {"type": "google.protobuf.Value", "data": {"customerEmail": "alice@example.com"}}},
+                },
+                "events": {
+                    "activity": {},
+                    "nexus": {},
+                    "signal": {"approval": {
+                        "type": "signal",
+                        "name": "approval",
+                        "count": 2,
+                        "parameters": {"arg0": {"type": "google.protobuf.Value", "data": {"refundId": "R-1001"}}},
+                    }},
+                    "update": {},
+                },
+                "inputEventsComplete": true,
+            })
+        );
     }
 
     #[test]
@@ -597,19 +979,19 @@ mod tests {
         let engine = PolicyEngine::new(policies, Some(SCHEMA)).unwrap();
         assert!(
             engine
-                .verify(&request(call("echo/echo/Echo", vec![])))
+                .verify_no_inputs(&request(call("echo/echo/Echo", vec![])))
                 .unwrap()
                 .allowed()
         );
         let mut other = request(call("echo/echo/Echo", vec![]));
         other["caller"]["workflowId"] = json!("marketing-1");
-        assert!(!engine.verify(&other).unwrap().allowed());
+        assert!(!engine.verify_no_inputs(&other).unwrap().allowed());
     }
 
     #[test]
     fn accepts_proto_field_names() {
         let verdict = engine()
-            .verify(&json!({
+            .verify_no_inputs(&json!({
                 "caller": {"task_queue": "queue-a", "workflow_id": "wf"},
                 "tool_calls": [{"name": "echo/echo/Echo"}],
             }))
@@ -645,9 +1027,9 @@ mod tests {
             vec![value_param(json!({"orderId": "o-1", "amount": 50}))],
         ));
         req["caller"]["workflowId"] = json!("order-7");
-        assert!(engine.verify(&req).unwrap().allowed());
+        assert!(engine.verify_no_inputs(&req).unwrap().allowed());
         req["caller"]["workflowId"] = json!("billing-7");
-        assert!(!engine.verify(&req).unwrap().allowed());
+        assert!(!engine.verify_no_inputs(&req).unwrap().allowed());
     }
 
     #[test]
@@ -661,16 +1043,26 @@ mod tests {
 
     #[test]
     fn malformed_input() {
-        assert!(engine().verify(&json!({"toolCalls": "nope"})).is_err());
-        assert!(engine().verify(&json!({"toolCalls": [42]})).is_err());
         assert!(
             engine()
-                .verify(&json!({"toolCalls": [{"parameters": []}]}))
+                .verify_no_inputs(&json!({"toolCalls": "nope"}))
                 .is_err()
         );
         assert!(
             engine()
-                .verify(&json!({"toolCalls": [{"name": "x", "parameters": [{"no": "type"}]}]}))
+                .verify_no_inputs(&json!({"toolCalls": [42]}))
+                .is_err()
+        );
+        assert!(
+            engine()
+                .verify_no_inputs(&json!({"toolCalls": [{"parameters": []}]}))
+                .is_err()
+        );
+        assert!(
+            engine()
+                .verify_no_inputs(
+                    &json!({"toolCalls": [{"name": "x", "parameters": [{"no": "type"}]}]})
+                )
                 .is_err()
         );
     }

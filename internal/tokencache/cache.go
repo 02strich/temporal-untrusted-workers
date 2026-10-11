@@ -5,21 +5,20 @@
 package tokencache
 
 import (
-	"container/list"
 	"context"
-	"hash/maphash"
-	"sync"
 	"time"
-)
 
-const numShards = 32
+	"github.com/02strich/temporal-untrusted-workers/internal/kvstore"
+)
 
 // Entry is the identity a task token was issued to.
 type Entry struct {
 	Namespace string
 	TaskQueue string
-	// WorkflowID is the workflow the task belongs to; empty for Nexus tasks.
+	// WorkflowID and RunID identify the workflow run the task belongs to;
+	// empty for Nexus tasks.
 	WorkflowID string
+	RunID      string
 }
 
 // Store records which identity each issued Temporal task token belongs to.
@@ -29,98 +28,6 @@ type Store interface {
 	Get(context.Context, []byte) (Entry, bool, error)
 	Delete(context.Context, []byte) error
 	Close() error
-}
-
-type item struct {
-	key       string
-	entry     Entry
-	expiresAt time.Time
-}
-
-type shard struct {
-	mu      sync.Mutex
-	items   map[string]*list.Element // key -> element in ll
-	ll      *list.List               // front = most recently used
-	maxSize int
-}
-
-func newShard(maxSize int) *shard {
-	return &shard{
-		items:   make(map[string]*list.Element),
-		ll:      list.New(),
-		maxSize: maxSize,
-	}
-}
-
-func (s *shard) put(key string, entry Entry, ttl time.Duration) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	expiresAt := time.Now().Add(ttl)
-	if el, ok := s.items[key]; ok {
-		el.Value.(*item).entry = entry
-		el.Value.(*item).expiresAt = expiresAt
-		s.ll.MoveToFront(el)
-		return
-	}
-
-	el := s.ll.PushFront(&item{key: key, entry: entry, expiresAt: expiresAt})
-	s.items[key] = el
-
-	for s.maxSize > 0 && len(s.items) > s.maxSize {
-		back := s.ll.Back()
-		if back == nil {
-			break
-		}
-		s.removeElement(back)
-	}
-}
-
-// get returns the entry for key, sliding its TTL forward and marking it most
-// recently used on a hit.
-func (s *shard) get(key string, ttl time.Duration) (Entry, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	el, ok := s.items[key]
-	if !ok {
-		return Entry{}, false
-	}
-	it := el.Value.(*item)
-	if time.Now().After(it.expiresAt) {
-		s.removeElement(el)
-		return Entry{}, false
-	}
-	it.expiresAt = time.Now().Add(ttl)
-	s.ll.MoveToFront(el)
-	return it.entry, true
-}
-
-func (s *shard) delete(key string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if el, ok := s.items[key]; ok {
-		s.removeElement(el)
-	}
-}
-
-// removeElement must be called with s.mu held.
-func (s *shard) removeElement(el *list.Element) {
-	s.ll.Remove(el)
-	delete(s.items, el.Value.(*item).key)
-}
-
-func (s *shard) evictExpired(now time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for el := s.ll.Back(); el != nil; {
-		prev := el.Prev()
-		if now.After(el.Value.(*item).expiresAt) {
-			s.removeElement(el)
-		}
-		el = prev
-	}
 }
 
 // Cache is a sharded, TTL + LRU-bounded map from task token to the identity
@@ -133,77 +40,36 @@ func (s *shard) evictExpired(now time.Time) {
 // activity does not heartbeat more often than the TTL, since Get slides the
 // TTL forward on every heartbeat but an idle token will otherwise expire.
 type Cache struct {
-	shards      [numShards]*shard
-	ttl         time.Duration
-	seed        maphash.Seed
-	stopJanitor chan struct{}
+	local *kvstore.Local[Entry]
 }
 
 // New creates a Cache with the given sliding TTL per entry and an
-// approximate global size cap (enforced per-shard via LRU eviction, so the
-// effective cap is maxSize rounded up to a multiple of the shard count).
+// approximate global size cap (see kvstore.NewLocal).
 func New(ttl time.Duration, maxSize int) *Cache {
-	perShard := max(maxSize/numShards, 1)
-
-	c := &Cache{
-		ttl:         ttl,
-		seed:        maphash.MakeSeed(),
-		stopJanitor: make(chan struct{}),
-	}
-	for i := range c.shards {
-		c.shards[i] = newShard(perShard)
-	}
-
-	interval := max(ttl/4, 15*time.Second)
-	go c.runJanitor(interval)
-
-	return c
+	return &Cache{local: kvstore.NewLocal[Entry](ttl, maxSize)}
 }
 
 // Close stops the background janitor goroutine. Safe to call once.
 func (c *Cache) Close() error {
-	close(c.stopJanitor)
-	return nil
-}
-
-func (c *Cache) runJanitor(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-c.stopJanitor:
-			return
-		case now := <-ticker.C:
-			for _, s := range c.shards {
-				s.evictExpired(now)
-			}
-		}
-	}
-}
-
-func (c *Cache) shardFor(token []byte) *shard {
-	var h maphash.Hash
-	h.SetSeed(c.seed)
-	h.Write(token)
-	return c.shards[h.Sum64()%numShards]
+	return c.local.Close()
 }
 
 // Put registers token as belonging to entry, sliding its expiry ttl forward
 // from now.
 func (c *Cache) Put(_ context.Context, token []byte, entry Entry) error {
-	c.shardFor(token).put(string(token), entry, c.ttl)
+	c.local.Put(string(token), entry)
 	return nil
 }
 
 // Get looks up token, returning its entry and true on a live hit. A hit
 // slides the token's TTL forward from now.
 func (c *Cache) Get(_ context.Context, token []byte) (Entry, bool, error) {
-	entry, ok := c.shardFor(token).get(string(token), c.ttl)
+	entry, ok := c.local.Get(string(token))
 	return entry, ok, nil
 }
 
 // Delete removes token, e.g. once a terminal Respond call has consumed it.
 func (c *Cache) Delete(_ context.Context, token []byte) error {
-	c.shardFor(token).delete(string(token))
+	c.local.Delete(string(token))
 	return nil
 }

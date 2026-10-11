@@ -115,7 +115,7 @@ func TestInterceptor_DeniesUnknownRPC(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	ctx := ctxWithBearer("key-a")
 	_, err, called := callInterceptor(t, interceptor, ctx,
@@ -137,7 +137,7 @@ func TestInterceptor_DeniesMissingCredentials(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	req := &workflowservice.PollWorkflowTaskQueueRequest{Namespace: "ns", TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-a"}}
 	_, err, called := callInterceptor(t, interceptor, context.Background(),
@@ -156,7 +156,7 @@ func TestInterceptor_DeniesInvalidAPIKey(t *testing.T) {
 	authr := &fakeAuthenticator{identities: map[string]auth.Identity{}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	req := &workflowservice.PollWorkflowTaskQueueRequest{Namespace: "ns", TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-a"}}
 	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("nonexistent-key"),
@@ -177,7 +177,7 @@ func TestInterceptor_PollAllowsMatchingQueue(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	req := &workflowservice.PollWorkflowTaskQueueRequest{Namespace: "ns", TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-a"}}
 	resp, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
@@ -207,7 +207,7 @@ func TestInterceptor_PollAllowsMultipleAuthorizedQueues(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	for _, taskQueue := range []string{"queue-a", "queue-b"} {
 		token := []byte("tok-" + taskQueue)
@@ -234,7 +234,7 @@ func TestInterceptor_PollNexusAllowsMatchingQueueAndCachesToken(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	req := &workflowservice.PollNexusTaskQueueRequest{
 		Namespace: "ns",
@@ -270,7 +270,7 @@ func TestInterceptor_PollNexusAllowsEmptyWorkerHeartbeatBatch(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	req := &workflowservice.PollNexusTaskQueueRequest{
 		Namespace: "ns",
@@ -294,7 +294,7 @@ func TestInterceptor_PollNexusDeniesWrongQueue(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	req := &workflowservice.PollNexusTaskQueueRequest{Namespace: "ns", TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-b"}}
 	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
@@ -315,7 +315,7 @@ func TestInterceptor_PollNexusDeniesWrongNamespace(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	req := &workflowservice.PollNexusTaskQueueRequest{Namespace: "ns-b", TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-a"}}
 	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
@@ -336,7 +336,7 @@ func TestInterceptor_PollNexusDeniesWrongWorkerHeartbeatQueue(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	req := &workflowservice.PollNexusTaskQueueRequest{
 		Namespace: "ns",
@@ -366,7 +366,7 @@ func workerInterceptor(t *testing.T, taskQueues ...string) grpc.UnaryServerInter
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	t.Cleanup(func() { _ = cache.Close() })
-	return NewInterceptor(authr, cache, nil)
+	return NewInterceptor(authr, cache, nil, nil)
 }
 
 func shutdownInterceptor(t *testing.T) grpc.UnaryServerInterceptor {
@@ -555,7 +555,7 @@ func TestInterceptor_PollDeniesWrongQueue(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	req := &workflowservice.PollWorkflowTaskQueueRequest{Namespace: "ns", TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-b"}}
 	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
@@ -576,7 +576,7 @@ func TestInterceptor_PollDeniesWrongNamespace(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	req := &workflowservice.PollWorkflowTaskQueueRequest{Namespace: "ns-b", TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-a"}}
 	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
@@ -598,7 +598,7 @@ func TestInterceptor_TokenScoping(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	// A token registered for queue-a's identity...
 	putCache(t, cache, []byte("tok-a"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
@@ -647,7 +647,7 @@ func TestInterceptor_TokenScopingAllowsAnyAuthorizedQueue(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	for _, tt := range []struct {
 		token     string
@@ -688,7 +688,7 @@ func TestInterceptor_TokenCacheGetErrorFailsClosed(t *testing.T) {
 	}}
 	cache := newFakeTokenStore()
 	cache.getErr = errors.New("cache read failed")
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	req := &workflowservice.RespondActivityTaskCompletedRequest{Namespace: "ns", TaskToken: []byte("tok-a")}
 	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
@@ -709,7 +709,7 @@ func TestInterceptor_TokenCachePutErrorFailsSuccessfulPoll(t *testing.T) {
 	}}
 	cache := newFakeTokenStore()
 	cache.putErr = errors.New("cache write failed")
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	req := &workflowservice.PollWorkflowTaskQueueRequest{Namespace: "ns", TaskQueue: &taskqueuepb.TaskQueue{Name: "queue-a"}}
 	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
@@ -731,7 +731,7 @@ func TestInterceptor_TokenCacheDeleteErrorDoesNotFailTerminalRPC(t *testing.T) {
 	cache := newFakeTokenStore()
 	cache.entries["tok-a"] = tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"}
 	cache.deleteErr = errors.New("cache delete failed")
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	req := &workflowservice.RespondActivityTaskCompletedRequest{Namespace: "ns", TaskToken: []byte("tok-a")}
 	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
@@ -753,7 +753,7 @@ func TestInterceptor_NexusResponsesUseTokenScoping(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	putCache(t, cache, []byte("nexus-tok-a"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
 
@@ -808,7 +808,7 @@ func TestInterceptor_NexusResponsesEvictToken(t *testing.T) {
 			}}
 			cache := tokencache.New(time.Hour, 1000)
 			defer cache.Close()
-			interceptor := NewInterceptor(authr, cache, nil)
+			interceptor := NewInterceptor(authr, cache, nil, nil)
 
 			putCache(t, cache, []byte("nexus-tok-a"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
 
@@ -831,7 +831,7 @@ func TestInterceptor_TerminalRPCEvictsToken(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	putCache(t, cache, []byte("tok-a"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
 
@@ -854,7 +854,7 @@ func TestInterceptor_HeartbeatDoesNotEvictToken(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	putCache(t, cache, []byte("tok-a"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
 
@@ -877,7 +877,7 @@ func TestInterceptor_HandlerErrorDoesNotMutateCache(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	putCache(t, cache, []byte("tok-a"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
 
@@ -903,7 +903,7 @@ func TestInterceptor_EagerDispatchTokensAreRegistered(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	putCache(t, cache, []byte("wt-tok"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-b"})
 
@@ -936,7 +936,7 @@ func TestInterceptor_DeniesCommandTargetingDifferentQueue(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	// The task token itself is legitimately bound to queue-a, but the
 	// emitted command tries to schedule an activity on queue-b.
@@ -980,7 +980,7 @@ func TestInterceptor_AllowsCommandTargetingOwnQueue(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	putCache(t, cache, []byte("wt-tok"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
 
@@ -1057,7 +1057,7 @@ func completeWorkflowTask(t *testing.T, verifier toolpolicy.Verifier, commands .
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, verifier)
+	interceptor := NewInterceptor(authr, cache, verifier, nil)
 
 	_, err, _ := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
 		"/temporal.api.workflowservice.v1.WorkflowService/PollWorkflowTaskQueue",
@@ -1161,7 +1161,7 @@ func TestInterceptor_GetSystemInfoNeedsOnlyValidIdentity(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
 		"/temporal.api.workflowservice.v1.WorkflowService/GetSystemInfo",
@@ -1209,7 +1209,7 @@ func TestInterceptor_LogsCloudActionPerBillableCommand(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 	putCache(t, cache, []byte("wt-tok"), tokencache.Entry{Namespace: "ns", TaskQueue: "queue-a"})
 
 	buf := captureLogs(t)
@@ -1258,7 +1258,7 @@ func TestInterceptor_PollEmitsNoCloudAction(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	buf := captureLogs(t)
 
@@ -1281,7 +1281,7 @@ func TestInterceptor_PollAllowsOwnStickyQueue(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	req := &workflowservice.PollWorkflowTaskQueueRequest{
 		Namespace: "ns",
@@ -1306,7 +1306,7 @@ func TestInterceptor_PollAllowsStickyQueueForAnyAuthorizedNormalQueue(t *testing
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	req := &workflowservice.PollWorkflowTaskQueueRequest{
 		Namespace: "ns",
@@ -1335,7 +1335,7 @@ func TestInterceptor_PollDeniesStickyQueueForDifferentNormalQueue(t *testing.T) 
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	// Even if the caller fabricates a NormalName equal to a *different*
 	// queue than its own, it must still be denied.
@@ -1365,7 +1365,7 @@ func TestInterceptor_DescribeNamespaceScopedToOwnNamespace(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	_, err, called := callInterceptor(t, interceptor, ctxWithBearer("key-a"),
 		"/temporal.api.workflowservice.v1.WorkflowService/DescribeNamespace",
@@ -1397,7 +1397,7 @@ func TestInterceptor_DoesNotLeakIdentityIntoOutgoingMetadata(t *testing.T) {
 	}}
 	cache := tokencache.New(time.Hour, 1000)
 	defer cache.Close()
-	interceptor := NewInterceptor(authr, cache, nil)
+	interceptor := NewInterceptor(authr, cache, nil, nil)
 
 	var sawOutgoing bool
 	handler := func(ctx context.Context, req any) (any, error) {

@@ -16,6 +16,7 @@ import (
 	"fmt"
 
 	commandpb "go.temporal.io/api/command/v1"
+	commonpb "go.temporal.io/api/common/v1"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	workerpb "go.temporal.io/api/worker/v1"
 	"go.temporal.io/api/workflowservice/v1"
@@ -138,8 +139,10 @@ func RequestTaskToken(req proto.Message) ([]byte, bool) {
 // workflow it belongs to.
 type IssuedToken struct {
 	Token []byte
-	// WorkflowID is empty for Nexus tasks, which belong to no workflow.
+	// WorkflowID and RunID are empty for Nexus tasks, which belong to no
+	// workflow.
 	WorkflowID string
+	RunID      string
 }
 
 // CollectResponseTaskTokens returns every task token embedded in a response
@@ -154,11 +157,11 @@ func CollectResponseTaskTokens(resp proto.Message) []IssuedToken {
 	switch r := resp.(type) {
 	case *workflowservice.PollWorkflowTaskQueueResponse:
 		if tok := r.GetTaskToken(); len(tok) > 0 {
-			return []IssuedToken{{Token: tok, WorkflowID: r.GetWorkflowExecution().GetWorkflowId()}}
+			return []IssuedToken{issued(tok, r.GetWorkflowExecution())}
 		}
 	case *workflowservice.PollActivityTaskQueueResponse:
 		if tok := r.GetTaskToken(); len(tok) > 0 {
-			return []IssuedToken{{Token: tok, WorkflowID: r.GetWorkflowExecution().GetWorkflowId()}}
+			return []IssuedToken{issued(tok, r.GetWorkflowExecution())}
 		}
 	case *workflowservice.PollNexusTaskQueueResponse:
 		if tok := r.GetTaskToken(); len(tok) > 0 {
@@ -168,17 +171,21 @@ func CollectResponseTaskTokens(resp proto.Message) []IssuedToken {
 		var tokens []IssuedToken
 		if wt := r.GetWorkflowTask(); wt != nil {
 			if tok := wt.GetTaskToken(); len(tok) > 0 {
-				tokens = append(tokens, IssuedToken{Token: tok, WorkflowID: wt.GetWorkflowExecution().GetWorkflowId()})
+				tokens = append(tokens, issued(tok, wt.GetWorkflowExecution()))
 			}
 		}
 		for _, at := range r.GetActivityTasks() {
 			if tok := at.GetTaskToken(); len(tok) > 0 {
-				tokens = append(tokens, IssuedToken{Token: tok, WorkflowID: at.GetWorkflowExecution().GetWorkflowId()})
+				tokens = append(tokens, issued(tok, at.GetWorkflowExecution()))
 			}
 		}
 		return tokens
 	}
 	return nil
+}
+
+func issued(token []byte, exec *commonpb.WorkflowExecution) IssuedToken {
+	return IssuedToken{Token: token, WorkflowID: exec.GetWorkflowId(), RunID: exec.GetRunId()}
 }
 
 // ValidateWorkerHeartbeatTaskQueues checks every heartbeat entry against the

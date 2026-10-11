@@ -211,7 +211,7 @@ func TestCollectResponseTaskTokens_Poll(t *testing.T) {
 
 	check := func(name string, got []IssuedToken, wantWorkflowID string) {
 		t.Helper()
-		if len(got) != 1 || string(got[0].Token) != string(tok) || got[0].WorkflowID != wantWorkflowID {
+		if len(got) != 1 || string(got[0].Token) != string(tok) || got[0].WorkflowID != wantWorkflowID || (wantWorkflowID != "" && got[0].RunID != "run-1") {
 			t.Fatalf("%s: unexpected tokens: %+v", name, got)
 		}
 	}
@@ -230,7 +230,7 @@ func TestCollectResponseTaskTokens_Poll(t *testing.T) {
 }
 
 func TestCollectResponseTaskTokens_EagerDispatch(t *testing.T) {
-	exec := &commonpb.WorkflowExecution{WorkflowId: "wf-1"}
+	exec := &commonpb.WorkflowExecution{WorkflowId: "wf-1", RunId: "run-1"}
 	resp := &workflowservice.RespondWorkflowTaskCompletedResponse{
 		WorkflowTask: &workflowservice.PollWorkflowTaskQueueResponse{TaskToken: []byte("workflow-task-tok"), WorkflowExecution: exec},
 		ActivityTasks: []*workflowservice.PollActivityTaskQueueResponse{
@@ -245,7 +245,7 @@ func TestCollectResponseTaskTokens_EagerDispatch(t *testing.T) {
 		t.Fatalf("expected %d tokens, got %d: %+v", len(want), len(got), got)
 	}
 	for i, g := range got {
-		if string(g.Token) != want[i] || g.WorkflowID != "wf-1" {
+		if string(g.Token) != want[i] || g.WorkflowID != "wf-1" || g.RunID != "run-1" {
 			t.Fatalf("token %d: got %+v, want %s for wf-1", i, g, want[i])
 		}
 	}

@@ -236,8 +236,8 @@ func TestLoad_NexusToolVerifier(t *testing.T) {
 		if v.NexusNamespace != "policy-ns" || v.NexusEndpoint != "policy-endpoint" || v.NexusService != "policy" {
 			t.Fatalf("unexpected nexus verifier config: %+v", v)
 		}
-		if v.NexusOperation != "VerifyToolCalls" {
-			t.Fatalf("unexpected default operation: %s", v.NexusOperation)
+		if v.NexusVerifyOperation != "VerifyToolCalls" {
+			t.Fatalf("unexpected default operation: %s", v.NexusVerifyOperation)
 		}
 		if v.Timeout.String() != "2s" {
 			t.Fatalf("unexpected timeout: %s", v.Timeout)
@@ -279,6 +279,42 @@ func TestLoad_NexusToolVerifierInvalidTimeout(t *testing.T) {
 	}, func() {
 		if _, err := Load(); err == nil {
 			t.Fatalf("expected error for non-positive verifier timeout")
+		}
+	})
+}
+
+func TestLoad_ToolVerifierInputDefaults(t *testing.T) {
+	withEnv(t, map[string]string{
+		"TEMPORAL_PROXY_STATIC_AUTH_FILE":              "/tmp/does-not-need-to-exist.json",
+		"TEMPORAL_PROXY_TOOL_VERIFIER":                 ToolVerifierNexus,
+		"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_NAMESPACE": "policy-ns",
+		"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_ENDPOINT":  "policy-endpoint",
+		"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_SERVICE":   "policy",
+		"TEMPORAL_PROXY_TOOL_VERIFIER_INPUT_EXCLUDE":   "activity:web-tools/*",
+		"TEMPORAL_PROXY_TOOL_VERIFIER_INPUT_MAX_RUNS":  "500",
+	}, func() {
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		v := cfg.ToolVerifier
+		if v.NexusRecordOperation != "RecordInputEvents" || v.InputInclude != "*" || v.InputExclude != "activity:web-tools/*" || v.InputMaxRuns != 500 {
+			t.Fatalf("unexpected input config: %+v", v)
+		}
+	})
+}
+
+func TestLoad_ToolVerifierInvalidInputFilter(t *testing.T) {
+	withEnv(t, map[string]string{
+		"TEMPORAL_PROXY_STATIC_AUTH_FILE":              "/tmp/does-not-need-to-exist.json",
+		"TEMPORAL_PROXY_TOOL_VERIFIER":                 ToolVerifierNexus,
+		"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_NAMESPACE": "policy-ns",
+		"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_ENDPOINT":  "policy-endpoint",
+		"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_SERVICE":   "policy",
+		"TEMPORAL_PROXY_TOOL_VERIFIER_INPUT_INCLUDE":   "activty:*",
+	}, func() {
+		if _, err := Load(); err == nil {
+			t.Fatalf("expected an invalid input filter to be rejected")
 		}
 	})
 }

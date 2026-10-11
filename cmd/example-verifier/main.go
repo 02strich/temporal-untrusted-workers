@@ -45,7 +45,8 @@ func run() error {
 	namespace := getEnv("TEMPORAL_NAMESPACE", "default")
 	taskQueue := getEnv("VERIFIER_TASK_QUEUE", "tool-verifier")
 	serviceName := getEnv("VERIFIER_SERVICE", "tool-policy")
-	operationName := getEnv("VERIFIER_OPERATION", toolpolicy.DefaultNexusOperation)
+	verifyOperation := getEnv("VERIFIER_VERIFY_OPERATION", toolpolicy.DefaultVerifyOperation)
+	recordOperation := getEnv("VERIFIER_RECORD_OPERATION", toolpolicy.DefaultRecordOperation)
 
 	allowed := parseToolList(os.Getenv("VERIFIER_ALLOWED_TOOLS"))
 	if allowed == nil {
@@ -65,15 +66,29 @@ func run() error {
 	defer c.Close()
 
 	service := nexus.NewService(serviceName)
-	if err := service.Register(nexus.NewSyncOperation(operationName, verifier(allowed, escalate))); err != nil {
-		return fmt.Errorf("registering operation: %w", err)
+	if err := service.Register(
+		nexus.NewSyncOperation(verifyOperation, verifier(allowed, escalate)),
+		nexus.NewSyncOperation(recordOperation, recordInputEvents),
+	); err != nil {
+		return fmt.Errorf("registering operations: %w", err)
 	}
 
 	w := worker.New(c, taskQueue, worker.Options{})
 	w.RegisterNexusService(service)
 
-	slog.Info("example-verifier running", "address", address, "namespace", namespace, "task_queue", taskQueue, "service", serviceName, "operation", operationName)
+	slog.Info("example-verifier running", "address", address, "namespace", namespace, "task_queue", taskQueue, "service", serviceName, "verify_operation", verifyOperation, "record_operation", recordOperation)
 	return w.Run(worker.InterruptCh())
+}
+
+// recordInputEvents is the RecordInputEvents operation handler. The proxy
+// sends a workflow run's context (its input, results, signals and updates)
+// here before the worker sees it; this example policy doesn't use it, so it
+// only logs and acknowledges the events. A verifier using them would store
+// them per run (deduplicating by event ID / update ID) for VerifyToolCalls.
+func recordInputEvents(_ context.Context, req *toolpolicypb.RecordInputEventsRequest, _ nexus.StartOperationOptions) (*toolpolicypb.RecordInputEventsResponse, error) {
+	caller := req.GetCaller()
+	slog.Debug("input events received", "workflow_id", caller.GetWorkflowId(), "run_id", caller.GetRunId(), "events", len(req.GetEvents()), "from_history_start", req.GetFromHistoryStart())
+	return &toolpolicypb.RecordInputEventsResponse{}, nil
 }
 
 // parseToolList parses a comma-separated list of tool names; nil means the

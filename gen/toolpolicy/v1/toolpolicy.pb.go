@@ -5,7 +5,15 @@
 // source: toolpolicy/v1/toolpolicy.proto
 
 // Contract between temporal-proxy and an operator-provided tool-call verifier
-// Nexus operation (TEMPORAL_PROXY_TOOL_VERIFIER=nexus).
+// Nexus service (TEMPORAL_PROXY_TOOL_VERIFIER=nexus). The service hosts two
+// operations:
+//
+//   - VerifyToolCalls (VerifyToolCallsRequest -> VerifyToolCallsResponse)
+//     judges the tool calls of a workflow task.
+//   - RecordInputEvents (RecordInputEventsRequest -> RecordInputEventsResponse)
+//     receives the context a workflow has been given (its input, results,
+//     signals, updates) before the worker sees it, so VerifyToolCalls can take
+//     it into account. Input events are never judged.
 //
 // The proxy enforces the local rules itself: activities on the workflow's own
 // task queue are allowed, and child workflows / continue-as-new must stay on
@@ -127,6 +135,71 @@ func (Decision) EnumDescriptor() ([]byte, []int) {
 	return file_toolpolicy_v1_toolpolicy_proto_rawDescGZIP(), []int{0}
 }
 
+// InputEventKind is the kind of an InputEvent. The proxy's input filter
+// refers to them as workflow, activity, nexus, signal and update.
+type InputEventKind int32
+
+const (
+	InputEventKind_INPUT_EVENT_KIND_UNSPECIFIED InputEventKind = 0
+	// The workflow's start input.
+	InputEventKind_INPUT_EVENT_KIND_WORKFLOW_INPUT InputEventKind = 1
+	// The result of a completed activity.
+	InputEventKind_INPUT_EVENT_KIND_ACTIVITY_RESULT InputEventKind = 2
+	// The result of a completed Nexus operation.
+	InputEventKind_INPUT_EVENT_KIND_NEXUS_OPERATION_RESULT InputEventKind = 3
+	// A signal and its input.
+	InputEventKind_INPUT_EVENT_KIND_SIGNAL InputEventKind = 4
+	// An update request and its input.
+	InputEventKind_INPUT_EVENT_KIND_UPDATE InputEventKind = 5
+)
+
+// Enum value maps for InputEventKind.
+var (
+	InputEventKind_name = map[int32]string{
+		0: "INPUT_EVENT_KIND_UNSPECIFIED",
+		1: "INPUT_EVENT_KIND_WORKFLOW_INPUT",
+		2: "INPUT_EVENT_KIND_ACTIVITY_RESULT",
+		3: "INPUT_EVENT_KIND_NEXUS_OPERATION_RESULT",
+		4: "INPUT_EVENT_KIND_SIGNAL",
+		5: "INPUT_EVENT_KIND_UPDATE",
+	}
+	InputEventKind_value = map[string]int32{
+		"INPUT_EVENT_KIND_UNSPECIFIED":            0,
+		"INPUT_EVENT_KIND_WORKFLOW_INPUT":         1,
+		"INPUT_EVENT_KIND_ACTIVITY_RESULT":        2,
+		"INPUT_EVENT_KIND_NEXUS_OPERATION_RESULT": 3,
+		"INPUT_EVENT_KIND_SIGNAL":                 4,
+		"INPUT_EVENT_KIND_UPDATE":                 5,
+	}
+)
+
+func (x InputEventKind) Enum() *InputEventKind {
+	p := new(InputEventKind)
+	*p = x
+	return p
+}
+
+func (x InputEventKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (InputEventKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_toolpolicy_v1_toolpolicy_proto_enumTypes[1].Descriptor()
+}
+
+func (InputEventKind) Type() protoreflect.EnumType {
+	return &file_toolpolicy_v1_toolpolicy_proto_enumTypes[1]
+}
+
+func (x InputEventKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use InputEventKind.Descriptor instead.
+func (InputEventKind) EnumDescriptor() ([]byte, []int) {
+	return file_toolpolicy_v1_toolpolicy_proto_rawDescGZIP(), []int{1}
+}
+
 // VerifyToolCallsRequest carries the tool calls of one workflow task
 // completion (RespondWorkflowTaskCompleted).
 type VerifyToolCallsRequest struct {
@@ -194,7 +267,9 @@ type Caller struct {
 	// The task queue that issued the workflow task token being completed.
 	TaskQueue string `protobuf:"bytes,3,opt,name=task_queue,json=taskQueue,proto3" json:"task_queue,omitempty"`
 	// The ID of the workflow whose task is being completed.
-	WorkflowId    string `protobuf:"bytes,4,opt,name=workflow_id,json=workflowId,proto3" json:"workflow_id,omitempty"`
+	WorkflowId string `protobuf:"bytes,4,opt,name=workflow_id,json=workflowId,proto3" json:"workflow_id,omitempty"`
+	// The run ID of that workflow.
+	RunId         string `protobuf:"bytes,5,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -253,6 +328,13 @@ func (x *Caller) GetTaskQueue() string {
 func (x *Caller) GetWorkflowId() string {
 	if x != nil {
 		return x.WorkflowId
+	}
+	return ""
+}
+
+func (x *Caller) GetRunId() string {
+	if x != nil {
+		return x.RunId
 	}
 	return ""
 }
@@ -370,6 +452,199 @@ func (x *VerifyToolCallsResponse) GetReason() string {
 	return ""
 }
 
+// RecordInputEventsRequest carries context a workflow run has received, sent
+// by the proxy before it hands the corresponding workflow task to the worker
+// (so it always arrives before any tool call based on it). The verifier never
+// judges these events: it stores them for the run and may use them when
+// deciding that run's tool calls. Events can be re-sent (e.g. after a proxy
+// restart, or when a recording is retried); deduplicate them by event_id, or
+// by update_id for updates.
+type RecordInputEventsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The workflow run that received the events.
+	Caller *Caller `protobuf:"bytes,1,opt,name=caller,proto3" json:"caller,omitempty"`
+	// The events, oldest first, after the proxy's input filter.
+	Events []*InputEvent `protobuf:"bytes,2,rep,name=events,proto3" json:"events,omitempty"`
+	// True if this batch starts at the run's first history event, i.e. the
+	// verifier now has the run's context from its start (subject to the filter).
+	FromHistoryStart bool `protobuf:"varint,3,opt,name=from_history_start,json=fromHistoryStart,proto3" json:"from_history_start,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *RecordInputEventsRequest) Reset() {
+	*x = RecordInputEventsRequest{}
+	mi := &file_toolpolicy_v1_toolpolicy_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RecordInputEventsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RecordInputEventsRequest) ProtoMessage() {}
+
+func (x *RecordInputEventsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_toolpolicy_v1_toolpolicy_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RecordInputEventsRequest.ProtoReflect.Descriptor instead.
+func (*RecordInputEventsRequest) Descriptor() ([]byte, []int) {
+	return file_toolpolicy_v1_toolpolicy_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *RecordInputEventsRequest) GetCaller() *Caller {
+	if x != nil {
+		return x.Caller
+	}
+	return nil
+}
+
+func (x *RecordInputEventsRequest) GetEvents() []*InputEvent {
+	if x != nil {
+		return x.Events
+	}
+	return nil
+}
+
+func (x *RecordInputEventsRequest) GetFromHistoryStart() bool {
+	if x != nil {
+		return x.FromHistoryStart
+	}
+	return false
+}
+
+// RecordInputEventsResponse acknowledges a RecordInputEventsRequest.
+type RecordInputEventsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RecordInputEventsResponse) Reset() {
+	*x = RecordInputEventsResponse{}
+	mi := &file_toolpolicy_v1_toolpolicy_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RecordInputEventsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RecordInputEventsResponse) ProtoMessage() {}
+
+func (x *RecordInputEventsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_toolpolicy_v1_toolpolicy_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RecordInputEventsResponse.ProtoReflect.Descriptor instead.
+func (*RecordInputEventsResponse) Descriptor() ([]byte, []int) {
+	return file_toolpolicy_v1_toolpolicy_proto_rawDescGZIP(), []int{5}
+}
+
+// InputEvent is one piece of context a workflow run has received.
+type InputEvent struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Kind  InputEventKind         `protobuf:"varint,1,opt,name=kind,proto3,enum=temporal_untrusted_workers.toolpolicy.v1.InputEventKind" json:"kind,omitempty"`
+	// Workflow input: the workflow type. Activity result:
+	// "<taskQueue>/<activityType>". Nexus result:
+	// "<endpoint>/<service>/<operation>". Signal / update: its name.
+	Name string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	// One Any per payload, mapped like ToolCall.parameters - except that a
+	// payload the proxy can't render is passed as the packed
+	// temporal.api.common.v1.Payload rather than rejected.
+	Payloads []*anypb.Any `protobuf:"bytes,3,rep,name=payloads,proto3" json:"payloads,omitempty"`
+	// The history event ID; 0 for an update not yet accepted into history.
+	EventId int64 `protobuf:"varint,4,opt,name=event_id,json=eventId,proto3" json:"event_id,omitempty"`
+	// The update ID, for updates.
+	UpdateId      string `protobuf:"bytes,5,opt,name=update_id,json=updateId,proto3" json:"update_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *InputEvent) Reset() {
+	*x = InputEvent{}
+	mi := &file_toolpolicy_v1_toolpolicy_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InputEvent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InputEvent) ProtoMessage() {}
+
+func (x *InputEvent) ProtoReflect() protoreflect.Message {
+	mi := &file_toolpolicy_v1_toolpolicy_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InputEvent.ProtoReflect.Descriptor instead.
+func (*InputEvent) Descriptor() ([]byte, []int) {
+	return file_toolpolicy_v1_toolpolicy_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *InputEvent) GetKind() InputEventKind {
+	if x != nil {
+		return x.Kind
+	}
+	return InputEventKind_INPUT_EVENT_KIND_UNSPECIFIED
+}
+
+func (x *InputEvent) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *InputEvent) GetPayloads() []*anypb.Any {
+	if x != nil {
+		return x.Payloads
+	}
+	return nil
+}
+
+func (x *InputEvent) GetEventId() int64 {
+	if x != nil {
+		return x.EventId
+	}
+	return 0
+}
+
+func (x *InputEvent) GetUpdateId() string {
+	if x != nil {
+		return x.UpdateId
+	}
+	return ""
+}
+
 var File_toolpolicy_v1_toolpolicy_proto protoreflect.FileDescriptor
 
 const file_toolpolicy_v1_toolpolicy_proto_rawDesc = "" +
@@ -378,14 +653,15 @@ const file_toolpolicy_v1_toolpolicy_proto_rawDesc = "" +
 	"\x16VerifyToolCallsRequest\x12H\n" +
 	"\x06caller\x18\x01 \x01(\v20.temporal_untrusted_workers.toolpolicy.v1.CallerR\x06caller\x12Q\n" +
 	"\n" +
-	"tool_calls\x18\x02 \x03(\v22.temporal_untrusted_workers.toolpolicy.v1.ToolCallR\ttoolCalls\"\x80\x01\n" +
+	"tool_calls\x18\x02 \x03(\v22.temporal_untrusted_workers.toolpolicy.v1.ToolCallR\ttoolCalls\"\x97\x01\n" +
 	"\x06Caller\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12\x18\n" +
 	"\asubject\x18\x02 \x01(\tR\asubject\x12\x1d\n" +
 	"\n" +
 	"task_queue\x18\x03 \x01(\tR\ttaskQueue\x12\x1f\n" +
 	"\vworkflow_id\x18\x04 \x01(\tR\n" +
-	"workflowId\"T\n" +
+	"workflowId\x12\x15\n" +
+	"\x06run_id\x18\x05 \x01(\tR\x05runId\"T\n" +
 	"\bToolCall\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x124\n" +
 	"\n" +
@@ -393,13 +669,32 @@ const file_toolpolicy_v1_toolpolicy_proto_rawDesc = "" +
 	"parameters\"\x90\x01\n" +
 	"\x17VerifyToolCallsResponse\x12N\n" +
 	"\bdecision\x18\x03 \x01(\x0e22.temporal_untrusted_workers.toolpolicy.v1.DecisionR\bdecision\x12\x16\n" +
-	"\x06reason\x18\x02 \x01(\tR\x06reasonJ\x04\b\x01\x10\x02R\aallowed*\x81\x01\n" +
+	"\x06reason\x18\x02 \x01(\tR\x06reasonJ\x04\b\x01\x10\x02R\aallowed\"\xe0\x01\n" +
+	"\x18RecordInputEventsRequest\x12H\n" +
+	"\x06caller\x18\x01 \x01(\v20.temporal_untrusted_workers.toolpolicy.v1.CallerR\x06caller\x12L\n" +
+	"\x06events\x18\x02 \x03(\v24.temporal_untrusted_workers.toolpolicy.v1.InputEventR\x06events\x12,\n" +
+	"\x12from_history_start\x18\x03 \x01(\bR\x10fromHistoryStart\"\x1b\n" +
+	"\x19RecordInputEventsResponse\"\xd8\x01\n" +
+	"\n" +
+	"InputEvent\x12L\n" +
+	"\x04kind\x18\x01 \x01(\x0e28.temporal_untrusted_workers.toolpolicy.v1.InputEventKindR\x04kind\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x120\n" +
+	"\bpayloads\x18\x03 \x03(\v2\x14.google.protobuf.AnyR\bpayloads\x12\x19\n" +
+	"\bevent_id\x18\x04 \x01(\x03R\aeventId\x12\x1b\n" +
+	"\tupdate_id\x18\x05 \x01(\tR\bupdateId*\x81\x01\n" +
 	"\bDecision\x12\x18\n" +
 	"\x14DECISION_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11DECISION_APPROVED\x10\x01\x12\x13\n" +
 	"\x0fDECISION_DENIED\x10\x02\x12\x15\n" +
 	"\x11DECISION_ESCALATE\x10\x03\x12\x18\n" +
-	"\x14DECISION_RETRY_LATER\x10\x04BOZMgithub.com/02strich/temporal-untrusted-workers/gen/toolpolicy/v1;toolpolicypbb\x06proto3"
+	"\x14DECISION_RETRY_LATER\x10\x04*\xe4\x01\n" +
+	"\x0eInputEventKind\x12 \n" +
+	"\x1cINPUT_EVENT_KIND_UNSPECIFIED\x10\x00\x12#\n" +
+	"\x1fINPUT_EVENT_KIND_WORKFLOW_INPUT\x10\x01\x12$\n" +
+	" INPUT_EVENT_KIND_ACTIVITY_RESULT\x10\x02\x12+\n" +
+	"'INPUT_EVENT_KIND_NEXUS_OPERATION_RESULT\x10\x03\x12\x1b\n" +
+	"\x17INPUT_EVENT_KIND_SIGNAL\x10\x04\x12\x1b\n" +
+	"\x17INPUT_EVENT_KIND_UPDATE\x10\x05BOZMgithub.com/02strich/temporal-untrusted-workers/gen/toolpolicy/v1;toolpolicypbb\x06proto3"
 
 var (
 	file_toolpolicy_v1_toolpolicy_proto_rawDescOnce sync.Once
@@ -413,26 +708,34 @@ func file_toolpolicy_v1_toolpolicy_proto_rawDescGZIP() []byte {
 	return file_toolpolicy_v1_toolpolicy_proto_rawDescData
 }
 
-var file_toolpolicy_v1_toolpolicy_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_toolpolicy_v1_toolpolicy_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
+var file_toolpolicy_v1_toolpolicy_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_toolpolicy_v1_toolpolicy_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
 var file_toolpolicy_v1_toolpolicy_proto_goTypes = []any{
-	(Decision)(0),                   // 0: temporal_untrusted_workers.toolpolicy.v1.Decision
-	(*VerifyToolCallsRequest)(nil),  // 1: temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsRequest
-	(*Caller)(nil),                  // 2: temporal_untrusted_workers.toolpolicy.v1.Caller
-	(*ToolCall)(nil),                // 3: temporal_untrusted_workers.toolpolicy.v1.ToolCall
-	(*VerifyToolCallsResponse)(nil), // 4: temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsResponse
-	(*anypb.Any)(nil),               // 5: google.protobuf.Any
+	(Decision)(0),                     // 0: temporal_untrusted_workers.toolpolicy.v1.Decision
+	(InputEventKind)(0),               // 1: temporal_untrusted_workers.toolpolicy.v1.InputEventKind
+	(*VerifyToolCallsRequest)(nil),    // 2: temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsRequest
+	(*Caller)(nil),                    // 3: temporal_untrusted_workers.toolpolicy.v1.Caller
+	(*ToolCall)(nil),                  // 4: temporal_untrusted_workers.toolpolicy.v1.ToolCall
+	(*VerifyToolCallsResponse)(nil),   // 5: temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsResponse
+	(*RecordInputEventsRequest)(nil),  // 6: temporal_untrusted_workers.toolpolicy.v1.RecordInputEventsRequest
+	(*RecordInputEventsResponse)(nil), // 7: temporal_untrusted_workers.toolpolicy.v1.RecordInputEventsResponse
+	(*InputEvent)(nil),                // 8: temporal_untrusted_workers.toolpolicy.v1.InputEvent
+	(*anypb.Any)(nil),                 // 9: google.protobuf.Any
 }
 var file_toolpolicy_v1_toolpolicy_proto_depIdxs = []int32{
-	2, // 0: temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsRequest.caller:type_name -> temporal_untrusted_workers.toolpolicy.v1.Caller
-	3, // 1: temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsRequest.tool_calls:type_name -> temporal_untrusted_workers.toolpolicy.v1.ToolCall
-	5, // 2: temporal_untrusted_workers.toolpolicy.v1.ToolCall.parameters:type_name -> google.protobuf.Any
+	3, // 0: temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsRequest.caller:type_name -> temporal_untrusted_workers.toolpolicy.v1.Caller
+	4, // 1: temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsRequest.tool_calls:type_name -> temporal_untrusted_workers.toolpolicy.v1.ToolCall
+	9, // 2: temporal_untrusted_workers.toolpolicy.v1.ToolCall.parameters:type_name -> google.protobuf.Any
 	0, // 3: temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsResponse.decision:type_name -> temporal_untrusted_workers.toolpolicy.v1.Decision
-	4, // [4:4] is the sub-list for method output_type
-	4, // [4:4] is the sub-list for method input_type
-	4, // [4:4] is the sub-list for extension type_name
-	4, // [4:4] is the sub-list for extension extendee
-	0, // [0:4] is the sub-list for field type_name
+	3, // 4: temporal_untrusted_workers.toolpolicy.v1.RecordInputEventsRequest.caller:type_name -> temporal_untrusted_workers.toolpolicy.v1.Caller
+	8, // 5: temporal_untrusted_workers.toolpolicy.v1.RecordInputEventsRequest.events:type_name -> temporal_untrusted_workers.toolpolicy.v1.InputEvent
+	1, // 6: temporal_untrusted_workers.toolpolicy.v1.InputEvent.kind:type_name -> temporal_untrusted_workers.toolpolicy.v1.InputEventKind
+	9, // 7: temporal_untrusted_workers.toolpolicy.v1.InputEvent.payloads:type_name -> google.protobuf.Any
+	8, // [8:8] is the sub-list for method output_type
+	8, // [8:8] is the sub-list for method input_type
+	8, // [8:8] is the sub-list for extension type_name
+	8, // [8:8] is the sub-list for extension extendee
+	0, // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_toolpolicy_v1_toolpolicy_proto_init() }
@@ -445,8 +748,8 @@ func file_toolpolicy_v1_toolpolicy_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_toolpolicy_v1_toolpolicy_proto_rawDesc), len(file_toolpolicy_v1_toolpolicy_proto_rawDesc)),
-			NumEnums:      1,
-			NumMessages:   4,
+			NumEnums:      2,
+			NumMessages:   7,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

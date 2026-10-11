@@ -19,6 +19,7 @@ import (
 
 	toolpolicypb "github.com/02strich/temporal-untrusted-workers/gen/toolpolicy/v1"
 	"github.com/02strich/temporal-untrusted-workers/internal/auth"
+	"github.com/02strich/temporal-untrusted-workers/internal/inputevents"
 )
 
 // fakeNexusClient implements the two standalone-Nexus RPCs NexusVerifier
@@ -74,12 +75,12 @@ func closedWithResult(data string) *workflowservice.PollNexusOperationExecutionR
 
 func newTestVerifier(client *fakeNexusClient) *NexusVerifier {
 	return &NexusVerifier{
-		Client:    client,
-		Namespace: "verifier-ns",
-		Endpoint:  "verifier-endpoint",
-		Service:   "policy",
-		Operation: DefaultNexusOperation,
-		Timeout:   time.Second,
+		Client:          client,
+		Namespace:       "verifier-ns",
+		Endpoint:        "verifier-endpoint",
+		Service:         "policy",
+		VerifyOperation: DefaultVerifyOperation,
+		Timeout:         time.Second,
 	}
 }
 
@@ -106,11 +107,15 @@ func testRequest() Request {
 			},
 		},
 	}
-	return Request{
+	return Request{Caller: testCaller(), Calls: FromCommands(commands, "queue-a")}
+}
+
+func testCaller() Caller {
+	return Caller{
 		Identity:   auth.Identity{Valid: true, Namespace: "ns-a", TaskQueues: []string{"queue-a", "queue-b"}, Subject: "fleet-a"},
 		TaskQueue:  "queue-a",
 		WorkflowID: "wf-1",
-		Calls:      FromCommands(commands, "queue-a"),
+		RunID:      "run-1",
 	}
 }
 
@@ -124,7 +129,7 @@ func TestNexusVerifier_Allowed(t *testing.T) {
 		t.Fatalf("expected one start, got %d", len(client.starts))
 	}
 	start := client.starts[0]
-	if start.GetNamespace() != "verifier-ns" || start.GetEndpoint() != "verifier-endpoint" || start.GetService() != "policy" || start.GetOperation() != DefaultNexusOperation {
+	if start.GetNamespace() != "verifier-ns" || start.GetEndpoint() != "verifier-endpoint" || start.GetService() != "policy" || start.GetOperation() != DefaultVerifyOperation {
 		t.Fatalf("unexpected start request: %+v", start)
 	}
 	if start.GetOperationId() == "" || start.GetRequestId() == "" {
@@ -161,7 +166,7 @@ func TestNexusVerifier_InputPayload(t *testing.T) {
 		t.Fatalf("decoding input: %v", err)
 	}
 	caller := got.GetCaller()
-	if caller.GetNamespace() != "ns-a" || caller.GetTaskQueue() != "queue-a" || caller.GetSubject() != "fleet-a" || caller.GetWorkflowId() != "wf-1" {
+	if caller.GetNamespace() != "ns-a" || caller.GetTaskQueue() != "queue-a" || caller.GetSubject() != "fleet-a" || caller.GetWorkflowId() != "wf-1" || caller.GetRunId() != "run-1" {
 		t.Fatalf("unexpected caller: %v", caller)
 	}
 	calls := got.GetToolCalls()
@@ -329,5 +334,64 @@ func TestNexusVerifier_Decisions(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestNexusVerifier_RecordInputEvents(t *testing.T) {
+	client := &fakeNexusClient{responses: []*workflowservice.PollNexusOperationExecutionResponse{closedWithResult(`{}`)}}
+	v := newTestVerifier(client)
+	v.RecordOperation = DefaultRecordOperation
+
+	batch := inputevents.Batch{
+		FromHistoryStart: true,
+		Events: []inputevents.Event{
+			{Kind: inputevents.KindWorkflowInput, Name: "AgentWorkflow", EventID: 1, Payloads: []*commonpb.Payload{jsonPlainPayload(`{"customerEmail":"alice@example.com"}`)}},
+			// Unrenderable for tool calls; input events fall back to the packed payload.
+			{Kind: inputevents.KindActivityResult, Name: "crm/Lookup", EventID: 7, Payloads: []*commonpb.Payload{{
+				Metadata: map[string][]byte{"encoding": []byte("binary/protobuf"), "messageType": []byte("acme.v1.Secret")},
+				Data:     []byte{0x0a, 0x01, 0x78},
+			}}},
+			{Kind: inputevents.KindUpdate, Name: "chat", UpdateID: "u-1"},
+		},
+	}
+	if err := v.RecordInputEvents(context.Background(), testCaller(), batch); err != nil {
+		t.Fatalf("RecordInputEvents: %v", err)
+	}
+
+	start := client.starts[0]
+	if start.GetOperation() != "RecordInputEvents" {
+		t.Fatalf("expected the input operation, got %q", start.GetOperation())
+	}
+	input := start.GetInput()
+	if mt := string(input.GetMetadata()["messageType"]); mt != "temporal_untrusted_workers.toolpolicy.v1.RecordInputEventsRequest" {
+		t.Fatalf("unexpected messageType %q", mt)
+	}
+	var got toolpolicypb.RecordInputEventsRequest
+	if err := protojson.Unmarshal(input.GetData(), &got); err != nil {
+		t.Fatalf("request is not valid protobuf JSON: %v\n%s", err, input.GetData())
+	}
+	if got.GetCaller().GetRunId() != "run-1" || !got.GetFromHistoryStart() || len(got.GetEvents()) != 3 {
+		t.Fatalf("unexpected request: %v", &got)
+	}
+	ev := got.GetEvents()
+	if ev[0].GetKind() != toolpolicypb.InputEventKind_INPUT_EVENT_KIND_WORKFLOW_INPUT || ev[0].GetName() != "AgentWorkflow" || ev[0].GetEventId() != 1 {
+		t.Fatalf("unexpected workflow input event: %v", ev[0])
+	}
+	if !ev[1].GetPayloads()[0].MessageIs(&commonpb.Payload{}) {
+		t.Fatalf("unrenderable payload should be passed as a packed Payload, got %v", ev[1].GetPayloads()[0])
+	}
+	if ev[2].GetKind() != toolpolicypb.InputEventKind_INPUT_EVENT_KIND_UPDATE || ev[2].GetUpdateId() != "u-1" || ev[2].GetEventId() != 0 {
+		t.Fatalf("unexpected update event: %v", ev[2])
+	}
+}
+
+func TestNexusVerifier_RecordInputEventsFailure(t *testing.T) {
+	client := &fakeNexusClient{startErr: errors.New("endpoint not found")}
+	v := newTestVerifier(client)
+	v.RecordOperation = DefaultRecordOperation
+	err := v.RecordInputEvents(context.Background(), testCaller(), inputevents.Batch{FromHistoryStart: true})
+	var unavailable UnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("expected UnavailableError, got %T: %v", err, err)
 	}
 }

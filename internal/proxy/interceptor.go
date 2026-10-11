@@ -40,10 +40,11 @@ func IdentityFromContext(ctx context.Context) (auth.Identity, bool) {
 // the entire access-control policy: RPC allowlisting, downstream API-key
 // authentication, namespace/task-queue/token scoping, and verification of
 // the tool calls workflows make outside their task queue via verifier
-// (toolpolicy.Default when nil). It must run before any handler - registering
-// it via grpc.UnaryInterceptor on the server that hosts proxy.Server
-// guarantees that.
-func NewInterceptor(authenticator auth.Authenticator, cache tokencache.Store, verifier toolpolicy.Verifier) grpc.UnaryServerInterceptor {
+// (toolpolicy.Default when nil). With inputs set, the input events of each
+// workflow task are recorded with the verifier before the task is handed to
+// the worker. It must run before any handler - registering it via
+// grpc.UnaryInterceptor on the server that hosts proxy.Server guarantees that.
+func NewInterceptor(authenticator auth.Authenticator, cache tokencache.Store, verifier toolpolicy.Verifier, inputs *Inputs) grpc.UnaryServerInterceptor {
 	if verifier == nil {
 		verifier = toolpolicy.Default{}
 	}
@@ -95,13 +96,37 @@ func NewInterceptor(authenticator auth.Authenticator, cache tokencache.Store, ve
 				}
 			}
 		}
+		if inputs != nil {
+			switch r := resp.(type) {
+			case *workflowservice.PollWorkflowTaskQueueResponse:
+				if len(r.GetTaskToken()) > 0 {
+					if err := inputs.record(ctx, identity, scopedTaskQueue, r); err != nil {
+						// The worker doesn't get the task; it is redelivered
+						// after its timeout, and recording is retried then.
+						slog.Error("recording input events failed; withholding workflow task", "rpc", rpcName, "subject", identity.Subject, "error", err)
+						return nil, status.Error(codes.Unavailable, "tool verifier unavailable")
+					}
+				}
+			case *workflowservice.RespondWorkflowTaskCompletedResponse:
+				if wt := r.GetWorkflowTask(); len(wt.GetTaskToken()) > 0 {
+					if err := inputs.record(ctx, identity, scopedTaskQueue, wt); err != nil {
+						// The completion already took effect upstream, so
+						// don't fail it: drop the eagerly dispatched task
+						// instead, and the worker polls for it normally.
+						slog.Warn("recording input events failed; dropping eagerly dispatched workflow task", "rpc", rpcName, "subject", identity.Subject, "error", err)
+						r.WorkflowTask = nil
+					}
+				}
+			}
+		}
+
 		if protoResp, ok := resp.(proto.Message); ok {
 			for _, issued := range scope.CollectResponseTaskTokens(protoResp) {
 				if scopedTaskQueue == "" {
 					slog.Error("missing task queue scope for response token", "rpc", rpcName, "subject", identity.Subject)
 					return nil, status.Error(codes.Internal, "proxy: missing task queue scope")
 				}
-				entry := tokencache.Entry{Namespace: identity.Namespace, TaskQueue: scopedTaskQueue, WorkflowID: issued.WorkflowID}
+				entry := tokencache.Entry{Namespace: identity.Namespace, TaskQueue: scopedTaskQueue, WorkflowID: issued.WorkflowID, RunID: issued.RunID}
 				if err := cache.Put(ctx, issued.Token, entry); err != nil {
 					slog.Error("token cache put failed after successful upstream RPC", "rpc", rpcName, "subject", identity.Subject, "error", err)
 					return nil, status.Error(codes.Unavailable, "token cache unavailable")
@@ -251,10 +276,13 @@ func authorizeRequest(ctx context.Context, req proto.Message, rpcName string, po
 				// task queue.
 				if calls := toolpolicy.FromCommands(r.GetCommands(), entry.TaskQueue); len(calls) > 0 {
 					if err := verifier.Verify(ctx, toolpolicy.Request{
-						Identity:   identity,
-						TaskQueue:  entry.TaskQueue,
-						WorkflowID: entry.WorkflowID,
-						Calls:      calls,
+						Caller: toolpolicy.Caller{
+							Identity:   identity,
+							TaskQueue:  entry.TaskQueue,
+							WorkflowID: entry.WorkflowID,
+							RunID:      entry.RunID,
+						},
+						Calls: calls,
 					}); err != nil {
 						return "", err
 					}

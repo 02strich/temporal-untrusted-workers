@@ -1,7 +1,15 @@
 syntax = "proto3";
 
 // Contract between temporal-proxy and an operator-provided tool-call verifier
-// Nexus operation (TEMPORAL_PROXY_TOOL_VERIFIER=nexus).
+// Nexus service (TEMPORAL_PROXY_TOOL_VERIFIER=nexus). The service hosts two
+// operations:
+//
+//   - VerifyToolCalls (VerifyToolCallsRequest -> VerifyToolCallsResponse)
+//     judges the tool calls of a workflow task.
+//   - RecordInputEvents (RecordInputEventsRequest -> RecordInputEventsResponse)
+//     receives the context a workflow has been given (its input, results,
+//     signals, updates) before the worker sees it, so VerifyToolCalls can take
+//     it into account. Input events are never judged.
 //
 // The proxy enforces the local rules itself: activities on the workflow's own
 // task queue are allowed, and child workflows / continue-as-new must stay on
@@ -62,6 +70,8 @@ message Caller {
   string task_queue = 3;
   // The ID of the workflow whose task is being completed.
   string workflow_id = 4;
+  // The run ID of that workflow.
+  string run_id = 5;
 }
 
 // ToolCall is one call that leaves the worker's own task queue.
@@ -106,4 +116,57 @@ enum Decision {
   // The proxy rejects the workflow task with Unavailable, as if the verifier
   // were unreachable.
   DECISION_RETRY_LATER = 4;
+}
+
+// RecordInputEventsRequest carries context a workflow run has received, sent
+// by the proxy before it hands the corresponding workflow task to the worker
+// (so it always arrives before any tool call based on it). The verifier never
+// judges these events: it stores them for the run and may use them when
+// deciding that run's tool calls. Events can be re-sent (e.g. after a proxy
+// restart, or when a recording is retried); deduplicate them by event_id, or
+// by update_id for updates.
+message RecordInputEventsRequest {
+  // The workflow run that received the events.
+  Caller caller = 1;
+  // The events, oldest first, after the proxy's input filter.
+  repeated InputEvent events = 2;
+  // True if this batch starts at the run's first history event, i.e. the
+  // verifier now has the run's context from its start (subject to the filter).
+  bool from_history_start = 3;
+}
+
+// RecordInputEventsResponse acknowledges a RecordInputEventsRequest.
+message RecordInputEventsResponse {}
+
+// InputEvent is one piece of context a workflow run has received.
+message InputEvent {
+  InputEventKind kind = 1;
+  // Workflow input: the workflow type. Activity result:
+  // "<taskQueue>/<activityType>". Nexus result:
+  // "<endpoint>/<service>/<operation>". Signal / update: its name.
+  string name = 2;
+  // One Any per payload, mapped like ToolCall.parameters - except that a
+  // payload the proxy can't render is passed as the packed
+  // temporal.api.common.v1.Payload rather than rejected.
+  repeated google.protobuf.Any payloads = 3;
+  // The history event ID; 0 for an update not yet accepted into history.
+  int64 event_id = 4;
+  // The update ID, for updates.
+  string update_id = 5;
+}
+
+// InputEventKind is the kind of an InputEvent. The proxy's input filter
+// refers to them as workflow, activity, nexus, signal and update.
+enum InputEventKind {
+  INPUT_EVENT_KIND_UNSPECIFIED = 0;
+  // The workflow's start input.
+  INPUT_EVENT_KIND_WORKFLOW_INPUT = 1;
+  // The result of a completed activity.
+  INPUT_EVENT_KIND_ACTIVITY_RESULT = 2;
+  // The result of a completed Nexus operation.
+  INPUT_EVENT_KIND_NEXUS_OPERATION_RESULT = 3;
+  // A signal and its input.
+  INPUT_EVENT_KIND_SIGNAL = 4;
+  // An update request and its input.
+  INPUT_EVENT_KIND_UPDATE = 5;
 }

@@ -85,9 +85,9 @@ func TestValkeyTokenKeyHashesToken(t *testing.T) {
 
 func TestValkeyStorePutWritesJSONWithTTL(t *testing.T) {
 	client := newFakeValkeyClient()
-	store := newValkeyStoreForClient(client, time.Hour)
+	store := NewValkeyStore(client, time.Hour)
 
-	if err := store.Put(context.Background(), []byte("token-a"), Entry{Namespace: "ns", TaskQueue: "queue-a", WorkflowID: "wf-1"}); err != nil {
+	if err := store.Put(context.Background(), []byte("token-a"), Entry{Namespace: "ns", TaskQueue: "queue-a", WorkflowID: "wf-1", RunID: "run-1"}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
@@ -102,16 +102,16 @@ func TestValkeyStorePutWritesJSONWithTTL(t *testing.T) {
 	if err := json.Unmarshal([]byte(client.values[client.lastPutKey]), &stored); err != nil {
 		t.Fatalf("stored value is not json: %v", err)
 	}
-	if stored.Namespace != "ns" || stored.TaskQueue != "queue-a" || stored.WorkflowID != "wf-1" {
+	if stored.Namespace != "ns" || stored.TaskQueue != "queue-a" || stored.WorkflowID != "wf-1" || stored.RunID != "run-1" {
 		t.Fatalf("unexpected stored entry: %+v", stored)
 	}
 }
 
 func TestValkeyStoreGetDecodesAndRefreshesTTL(t *testing.T) {
 	client := newFakeValkeyClient()
-	store := newValkeyStoreForClient(client, 30*time.Minute)
+	store := NewValkeyStore(client, 30*time.Minute)
 
-	value, err := encodeValkeyEntry(Entry{Namespace: "ns", TaskQueue: "queue-a", WorkflowID: "wf-1"})
+	value, err := encodeValkeyEntry(Entry{Namespace: "ns", TaskQueue: "queue-a", WorkflowID: "wf-1", RunID: "run-1"})
 	if err != nil {
 		t.Fatalf("encodeValkeyEntry: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestValkeyStoreGetDecodesAndRefreshesTTL(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected token to be found")
 	}
-	if entry.Namespace != "ns" || entry.TaskQueue != "queue-a" || entry.WorkflowID != "wf-1" {
+	if entry.Namespace != "ns" || entry.TaskQueue != "queue-a" || entry.WorkflowID != "wf-1" || entry.RunID != "run-1" {
 		t.Fatalf("unexpected entry: %+v", entry)
 	}
 	if client.lastGetKey != tokenKey([]byte("token-a")) {
@@ -137,7 +137,7 @@ func TestValkeyStoreGetDecodesAndRefreshesTTL(t *testing.T) {
 
 func TestValkeyStoreGetMiss(t *testing.T) {
 	client := newFakeValkeyClient()
-	store := newValkeyStoreForClient(client, time.Hour)
+	store := NewValkeyStore(client, time.Hour)
 
 	if _, ok, err := store.Get(context.Background(), []byte("missing")); err != nil {
 		t.Fatalf("Get: %v", err)
@@ -148,7 +148,7 @@ func TestValkeyStoreGetMiss(t *testing.T) {
 
 func TestValkeyStoreDelete(t *testing.T) {
 	client := newFakeValkeyClient()
-	store := newValkeyStoreForClient(client, time.Hour)
+	store := NewValkeyStore(client, time.Hour)
 	key := tokenKey([]byte("token-a"))
 	client.values[key] = "value"
 
@@ -168,7 +168,7 @@ func TestValkeyStoreClientErrors(t *testing.T) {
 	client.putErr = errors.New("put failed")
 	client.getErr = errors.New("get failed")
 	client.deleteErr = errors.New("delete failed")
-	store := newValkeyStoreForClient(client, time.Hour)
+	store := NewValkeyStore(client, time.Hour)
 
 	if err := store.Put(context.Background(), []byte("token-a"), Entry{Namespace: "ns", TaskQueue: "queue-a"}); err == nil {
 		t.Fatalf("expected put error")
@@ -183,7 +183,7 @@ func TestValkeyStoreClientErrors(t *testing.T) {
 
 func TestValkeyStoreGetInvalidJSON(t *testing.T) {
 	client := newFakeValkeyClient()
-	store := newValkeyStoreForClient(client, time.Hour)
+	store := NewValkeyStore(client, time.Hour)
 	client.values[tokenKey([]byte("token-a"))] = "{"
 
 	if _, _, err := store.Get(context.Background(), []byte("token-a")); err == nil {
@@ -193,12 +193,12 @@ func TestValkeyStoreGetInvalidJSON(t *testing.T) {
 
 func TestValkeyStoreClose(t *testing.T) {
 	client := newFakeValkeyClient()
-	store := newValkeyStoreForClient(client, time.Hour)
+	store := NewValkeyStore(client, time.Hour)
 
 	if err := store.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if !client.closed {
-		t.Fatalf("expected client to be closed")
+	if client.closed {
+		t.Fatalf("the store must not close the caller's client")
 	}
 }

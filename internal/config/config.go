@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/02strich/temporal-untrusted-workers/internal/inputevents"
 )
 
 const (
@@ -31,7 +33,8 @@ const (
 	ToolVerifierNone  = "none"
 	ToolVerifierNexus = "nexus"
 
-	defaultToolVerifierNexusOperation = "VerifyToolCalls"
+	defaultToolVerifierNexusVerifyOperation = "VerifyToolCalls"
+	defaultToolVerifierNexusRecordOperation = "RecordInputEvents"
 )
 
 // UpstreamConfig configures the proxy's connection to the real Temporal
@@ -78,8 +81,21 @@ type ToolVerifierConfig struct {
 	NexusNamespace string
 	NexusEndpoint  string
 	NexusService   string
-	NexusOperation string
-	Timeout        time.Duration
+	// NexusVerifyOperation decides tool calls (VerifyToolCalls).
+	NexusVerifyOperation string
+	Timeout              time.Duration
+
+	// Input events (workflow input, activity and Nexus results, signals,
+	// updates) are recorded with the verifier via NexusRecordOperation
+	// (RecordInputEvents).
+	NexusRecordOperation string
+	// InputInclude and InputExclude are comma-separated "<kind>:<glob>"
+	// filter patterns (see inputevents.Filter).
+	InputInclude string
+	InputExclude string
+	// InputMaxRuns bounds the runs whose recording progress the local
+	// backend remembers.
+	InputMaxRuns int
 }
 
 // Config is the fully validated proxy configuration.
@@ -138,11 +154,14 @@ func Load() (Config, error) {
 			TLSCAFile: os.Getenv("TEMPORAL_PROXY_VALKEY_TLS_CA_FILE"),
 		},
 		ToolVerifier: ToolVerifierConfig{
-			Mode:           getEnv("TEMPORAL_PROXY_TOOL_VERIFIER", ToolVerifierNone),
-			NexusNamespace: os.Getenv("TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_NAMESPACE"),
-			NexusEndpoint:  os.Getenv("TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_ENDPOINT"),
-			NexusService:   os.Getenv("TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_SERVICE"),
-			NexusOperation: getEnv("TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_OPERATION", defaultToolVerifierNexusOperation),
+			Mode:                 getEnv("TEMPORAL_PROXY_TOOL_VERIFIER", ToolVerifierNone),
+			NexusNamespace:       os.Getenv("TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_NAMESPACE"),
+			NexusEndpoint:        os.Getenv("TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_ENDPOINT"),
+			NexusService:         os.Getenv("TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_SERVICE"),
+			NexusVerifyOperation: getEnv("TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_VERIFY_OPERATION", defaultToolVerifierNexusVerifyOperation),
+			NexusRecordOperation: getEnv("TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_RECORD_OPERATION", defaultToolVerifierNexusRecordOperation),
+			InputInclude:         getEnv("TEMPORAL_PROXY_TOOL_VERIFIER_INPUT_INCLUDE", "*"),
+			InputExclude:         os.Getenv("TEMPORAL_PROXY_TOOL_VERIFIER_INPUT_EXCLUDE"),
 		},
 		LogLevel: getEnv("TEMPORAL_PROXY_LOG_LEVEL", "info"),
 	}
@@ -190,6 +209,12 @@ func Load() (Config, error) {
 		errs = append(errs, err)
 	}
 	cfg.ToolVerifier.Timeout = verifierTimeout
+
+	inputMaxRuns, err := getEnvInt("TEMPORAL_PROXY_TOOL_VERIFIER_INPUT_MAX_RUNS", 10_000)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	cfg.ToolVerifier.InputMaxRuns = inputMaxRuns
 
 	errs = append(errs, cfg.validate()...)
 
@@ -283,7 +308,8 @@ func (c Config) validate() []error {
 			{"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_NAMESPACE", c.ToolVerifier.NexusNamespace},
 			{"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_ENDPOINT", c.ToolVerifier.NexusEndpoint},
 			{"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_SERVICE", c.ToolVerifier.NexusService},
-			{"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_OPERATION", c.ToolVerifier.NexusOperation},
+			{"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_VERIFY_OPERATION", c.ToolVerifier.NexusVerifyOperation},
+			{"TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_RECORD_OPERATION", c.ToolVerifier.NexusRecordOperation},
 		}
 		for _, r := range required {
 			if r.value == "" {
@@ -292,6 +318,12 @@ func (c Config) validate() []error {
 		}
 		if c.ToolVerifier.Timeout <= 0 {
 			errs = append(errs, errors.New("TEMPORAL_PROXY_TOOL_VERIFIER_TIMEOUT must be positive"))
+		}
+		if _, err := inputevents.ParseFilter(c.ToolVerifier.InputInclude, c.ToolVerifier.InputExclude); err != nil {
+			errs = append(errs, fmt.Errorf("TEMPORAL_PROXY_TOOL_VERIFIER_INPUT_INCLUDE/_EXCLUDE: %w", err))
+		}
+		if c.ToolVerifier.InputMaxRuns <= 0 {
+			errs = append(errs, errors.New("TEMPORAL_PROXY_TOOL_VERIFIER_INPUT_MAX_RUNS must be positive"))
 		}
 	default:
 		errs = append(errs, fmt.Errorf("TEMPORAL_PROXY_TOOL_VERIFIER: invalid value %q (want %q or %q)", c.ToolVerifier.Mode, ToolVerifierNone, ToolVerifierNexus))

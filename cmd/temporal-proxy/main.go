@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -22,6 +23,8 @@ import (
 
 	"github.com/02strich/temporal-untrusted-workers/internal/auth"
 	"github.com/02strich/temporal-untrusted-workers/internal/config"
+	"github.com/02strich/temporal-untrusted-workers/internal/inputevents"
+	"github.com/02strich/temporal-untrusted-workers/internal/kvstore"
 	"github.com/02strich/temporal-untrusted-workers/internal/proxy"
 	"github.com/02strich/temporal-untrusted-workers/internal/tokencache"
 	"github.com/02strich/temporal-untrusted-workers/internal/toolpolicy"
@@ -59,19 +62,31 @@ func run() error {
 	}
 	defer upstreamConn.Close()
 
-	cache, err := buildTokenCache(context.Background(), cfg)
-	if err != nil {
-		return fmt.Errorf("building token cache: %w", err)
-	}
-	defer func() {
-		if err := cache.Close(); err != nil {
-			slog.Warn("closing token cache", "error", err)
+	// With the Valkey backend, one client serves both the token cache and the
+	// input-event state store. run owns it; the stores built on it don't close
+	// it. Deferred closes run in reverse, so the stores close before it.
+	var kv kvstore.Client
+	if cfg.TokenCacheBackend == config.TokenCacheBackendValkey {
+		if kv, err = dialValkey(context.Background(), cfg.Valkey); err != nil {
+			return fmt.Errorf("connecting to valkey: %w", err)
 		}
-	}()
+		defer closeLogged("valkey client", kv)
+	}
 
-	verifier := buildToolVerifier(cfg.ToolVerifier, upstreamClient)
+	cache := buildTokenCache(cfg, kv)
+	defer closeLogged("token cache", cache)
 
-	serverOpts := []grpc.ServerOption{grpc.UnaryInterceptor(proxy.NewInterceptor(authenticator, cache, verifier))}
+	inputState := buildInputStateStore(cfg, kv)
+	if inputState != nil {
+		defer closeLogged("input state store", inputState)
+	}
+
+	verifier, inputs, err := buildToolVerifier(cfg, upstreamClient, inputState)
+	if err != nil {
+		return fmt.Errorf("building tool verifier: %w", err)
+	}
+
+	serverOpts := []grpc.ServerOption{grpc.UnaryInterceptor(proxy.NewInterceptor(authenticator, cache, verifier, inputs))}
 	if cfg.Downstream.TLSMode == config.TLSModeTLS {
 		creds, err := credentials.NewServerTLSFromFile(cfg.Downstream.CertFile, cfg.Downstream.KeyFile)
 		if err != nil {
@@ -115,45 +130,77 @@ func configureLogging(level string) {
 	slog.SetLogLoggerLevel(lvl)
 }
 
-func buildTokenCache(ctx context.Context, cfg config.Config) (tokencache.Store, error) {
-	switch cfg.TokenCacheBackend {
-	case config.TokenCacheBackendValkey:
-		tlsConfig, err := valkeyTLSConfig(cfg.Valkey)
-		if err != nil {
-			return nil, err
-		}
-		pingTimeout := maxDuration(cfg.Valkey.DialTimeout, cfg.Valkey.ReadTimeout)
-		pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
-		defer cancel()
-		return tokencache.NewValkeyStore(pingCtx, tokencache.ValkeyOptions{
-			Addrs:        cfg.Valkey.Addrs,
-			Password:     cfg.Valkey.Password,
-			TLSConfig:    tlsConfig,
-			DialTimeout:  cfg.Valkey.DialTimeout,
-			ReadTimeout:  cfg.Valkey.ReadTimeout,
-			WriteTimeout: cfg.Valkey.WriteTimeout,
-			TTL:          cfg.TokenCacheTTL,
-		})
-	default:
-		return tokencache.New(cfg.TokenCacheTTL, cfg.TokenCacheMaxSize), nil
+func dialValkey(ctx context.Context, cfg config.ValkeyConfig) (kvstore.Client, error) {
+	tlsConfig, err := valkeyTLSConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, maxDuration(cfg.DialTimeout, cfg.ReadTimeout))
+	defer cancel()
+	return kvstore.NewValkeyClient(pingCtx, kvstore.ValkeyOptions{
+		Addrs:        cfg.Addrs,
+		Password:     cfg.Password,
+		TLSConfig:    tlsConfig,
+		DialTimeout:  cfg.DialTimeout,
+		ReadTimeout:  cfg.ReadTimeout,
+		WriteTimeout: cfg.WriteTimeout,
+	})
+}
+
+// buildTokenCache returns the token cache: Valkey-backed when kv is set,
+// local otherwise.
+func buildTokenCache(cfg config.Config, kv kvstore.Client) tokencache.Store {
+	if kv != nil {
+		return tokencache.NewValkeyStore(kv, cfg.TokenCacheTTL)
+	}
+	return tokencache.New(cfg.TokenCacheTTL, cfg.TokenCacheMaxSize)
+}
+
+// buildInputStateStore returns the input-event state store, using the token
+// cache's backend: Valkey-backed when kv is set, local otherwise. It returns
+// nil unless the Nexus tool verifier (the only user of input events) is
+// configured.
+func buildInputStateStore(cfg config.Config, kv kvstore.Client) inputevents.StateStore {
+	if cfg.ToolVerifier.Mode != config.ToolVerifierNexus {
+		return nil
+	}
+	if kv != nil {
+		return inputevents.NewValkeyStore(kv, cfg.TokenCacheTTL)
+	}
+	return inputevents.NewLocalStore(cfg.TokenCacheTTL, cfg.ToolVerifier.InputMaxRuns)
+}
+
+// closeLogged closes c, logging (rather than returning) a failure, for
+// deferred cleanup on shutdown.
+func closeLogged(name string, c io.Closer) {
+	if err := c.Close(); err != nil {
+		slog.Warn("closing "+name, "error", err)
 	}
 }
 
-// buildToolVerifier returns the configured toolpolicy.Verifier. The Nexus
-// verifier runs its standalone Nexus operations over the upstream connection,
-// so it reuses the proxy's upstream credentials.
-func buildToolVerifier(cfg config.ToolVerifierConfig, upstreamClient workflowservice.WorkflowServiceClient) toolpolicy.Verifier {
-	if cfg.Mode != config.ToolVerifierNexus {
-		return toolpolicy.Default{}
+// buildToolVerifier returns the configured toolpolicy.Verifier and, for the
+// Nexus verifier, the input-event recording setup using inputState (nil
+// otherwise). The Nexus verifier runs its standalone Nexus operations over the
+// upstream connection, so it reuses the proxy's upstream credentials.
+func buildToolVerifier(cfg config.Config, upstreamClient workflowservice.WorkflowServiceClient, inputState inputevents.StateStore) (toolpolicy.Verifier, *proxy.Inputs, error) {
+	tv := cfg.ToolVerifier
+	if tv.Mode != config.ToolVerifierNexus {
+		return toolpolicy.Default{}, nil, nil
 	}
-	return &toolpolicy.NexusVerifier{
-		Client:    upstreamClient,
-		Namespace: cfg.NexusNamespace,
-		Endpoint:  cfg.NexusEndpoint,
-		Service:   cfg.NexusService,
-		Operation: cfg.NexusOperation,
-		Timeout:   cfg.Timeout,
+	verifier := &toolpolicy.NexusVerifier{
+		Client:          upstreamClient,
+		Namespace:       tv.NexusNamespace,
+		Endpoint:        tv.NexusEndpoint,
+		Service:         tv.NexusService,
+		VerifyOperation: tv.NexusVerifyOperation,
+		RecordOperation: tv.NexusRecordOperation,
+		Timeout:         tv.Timeout,
 	}
+	filter, err := inputevents.ParseFilter(tv.InputInclude, tv.InputExclude)
+	if err != nil {
+		return nil, nil, err
+	}
+	return verifier, &proxy.Inputs{Store: inputState, Filter: filter, Recorder: verifier}, nil
 }
 
 func valkeyTLSConfig(cfg config.ValkeyConfig) (*tls.Config, error) {

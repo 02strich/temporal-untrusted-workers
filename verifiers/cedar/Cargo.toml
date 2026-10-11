@@ -9,7 +9,8 @@ publish = false
 [dependencies]
 anyhow = "1"
 cedar-policy = "4.13"
-serde_json = "1"
+# preserve_order keeps logged JSON (e.g. the evaluated context) in field order.
+serde_json = { version = "1", features = ["preserve_order"] }
 temporalio-client = "~1.0.0"
 # vendored-protox compiles Temporal's protos without a system `protoc`.
 temporalio-common = { version = "~1.0.0", features = ["vendored-protox"] }

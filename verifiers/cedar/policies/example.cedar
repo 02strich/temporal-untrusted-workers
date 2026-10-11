@@ -37,11 +37,30 @@ unless {
 };
 
 // The SendEmail activity, hosted by trusted workers on the trusted-tools task
-// queue, may only email example.com addresses.
-@id("send-email-to-example-com")
+// queue, may only email the customer the workflow was started for - not an
+// address an injected prompt made up. Requires the run's full context.
+@id("send-email-to-customer")
 permit (principal, action == Action::"trusted-tools/SendEmail", resource)
 when {
+  context.inputEventsComplete &&
+  context.workflowInput.parameters has arg0 &&
+  context.workflowInput.parameters.arg0.data has customerEmail &&
   context.parameters has arg0 &&
   context.parameters.arg0.data has value &&
-  context.parameters.arg0.data.value like "*@example.com"
+  context.parameters.arg0.data.value == context.workflowInput.parameters.arg0.data.customerEmail
+};
+
+// IssueRefund needs a human's approval, given to the workflow as an
+// `approval` signal naming the refund (e.g. {"refundId": "R-1001",
+// "approvedBy": "manager@example.com"}). The workflow can't approve itself:
+// signals are sent from outside it.
+@id("refund-needs-approval")
+permit (principal, action == Action::"trusted-tools/IssueRefund", resource)
+when {
+  context.events.signal has approval &&
+  context.events.signal.approval.parameters has arg0 &&
+  context.events.signal.approval.parameters.arg0.data has refundId &&
+  context.parameters has arg0 &&
+  context.parameters.arg0.data has value &&
+  context.parameters.arg0.data.value == context.events.signal.approval.parameters.arg0.data.refundId
 };

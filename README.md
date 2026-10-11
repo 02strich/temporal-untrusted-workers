@@ -162,8 +162,12 @@ All configuration is via environment variables (`internal/config/config.go`).
 | `TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_NAMESPACE` | — | Required in `nexus` mode. Caller namespace the verification operation runs in; the endpoint must allow it. |
 | `TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_ENDPOINT` | — | Required in `nexus` mode. Nexus endpoint name. |
 | `TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_SERVICE` | — | Required in `nexus` mode. Nexus service name. |
-| `TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_OPERATION` | `VerifyToolCalls` | Nexus operation name. |
-| `TEMPORAL_PROXY_TOOL_VERIFIER_TIMEOUT` | `5s` | Maximum time to wait for a verdict per `RespondWorkflowTaskCompleted`. |
+| `TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_VERIFY_OPERATION` | `VerifyToolCalls` | Nexus operation that decides tool calls. |
+| `TEMPORAL_PROXY_TOOL_VERIFIER_TIMEOUT` | `5s` | Maximum time to wait for a verdict, or for an input-event recording. |
+| `TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_RECORD_OPERATION` | `RecordInputEvents` | Nexus operation that receives input events. See [Input events](#input-events). |
+| `TEMPORAL_PROXY_TOOL_VERIFIER_INPUT_INCLUDE` | `*` | Comma-separated `<kind>:<glob>` patterns of input events to send. |
+| `TEMPORAL_PROXY_TOOL_VERIFIER_INPUT_EXCLUDE` | — | Comma-separated `<kind>:<glob>` patterns of input events to drop. |
+| `TEMPORAL_PROXY_TOOL_VERIFIER_INPUT_MAX_RUNS` | `10000` | Runs whose recording progress the local backend remembers. |
 
 ---
 
@@ -252,6 +256,52 @@ task's normal timeout.
 
 - The proxy **fails closed**. A failed operation, a malformed result, or no result within
   `TEMPORAL_PROXY_TOOL_VERIFIER_TIMEOUT` rejects the call with `Unavailable`, and the worker retries.
+
+### Input events
+
+A policy often needs to know what the workflow was given, not just what it's asking for. For example,
+"an agent may only email addresses the customer provided", or "only charge after a CRM lookup". So in
+`nexus` mode the proxy also sends each workflow run's **input events** to the verifier, through a
+second operation on the same Nexus service: `RecordInputEvents`, defined by
+`RecordInputEventsRequest` in the same proto. The verifier never judges these events. It stores them
+per run, keyed by `caller.workflowId` and `caller.runId`, and uses them when deciding that run's tool
+calls.
+
+| Kind (in filters) | Event | Name |
+|-------------------|-------|------|
+| `workflow` | the workflow's start input | the workflow type |
+| `activity` | an activity result | `<taskQueue>/<activityType>` |
+| `nexus` | a Nexus operation result | `<endpoint>/<service>/<operation>` |
+| `signal` | a signal and its input | the signal name |
+| `update` | an update request and its input | the update name |
+
+Payloads are mapped like tool-call parameters. A payload the proxy can't render is passed as the
+packed `Payload` instead of being rejected.
+
+**Filtering.** `TEMPORAL_PROXY_TOOL_VERIFIER_INPUT_INCLUDE` (default `*`) and `..._INPUT_EXCLUDE`
+take comma-separated `<kind>:<glob>` patterns, where `*` matches anything, including `/`. An event
+is sent if it matches an include pattern and no exclude pattern. For example,
+`EXCLUDE=activity:web-tools/*` keeps scraped web content from counting as something the customer
+said. `INCLUDE=workflow:*,signal:*,update:*` sends only what the customer sent.
+
+**Delivery.** The proxy takes the events from the workflow-task poll responses it relays. It records
+them with the verifier *before* handing the task to the worker, so the verifier always has the
+context before any tool call based on it.
+- If recording fails, the worker gets `Unavailable` instead of the task, and the task is
+  redelivered after its timeout.
+- An eagerly dispatched task in a `RespondWorkflowTaskCompleted` response is dropped instead, and
+  the worker polls for it normally.
+- Each recording is a standalone Nexus operation. That adds latency to polls that carry new events,
+  and on Temporal Cloud it counts as an action.
+
+**Per-run state.** With sticky execution a poll carries only the events since the worker's previous
+task. The proxy therefore remembers, per run, how far it has recorded and which activity and Nexus
+results are still pending. That state uses the token cache's backend:
+- `local`: in memory, so it's lost when the proxy restarts.
+- `valkey`: shared between proxy instances, and it survives restarts.
+
+A batch that starts at the run's first history event sets `fromHistoryStart`. The verifier can use
+that to tell whether it has the run's full context.
 
 `cmd/example-verifier` is a reference handler in Go. It allows the tool names listed in
 `VERIFIER_ALLOWED_TOOLS`, escalates those listed in `VERIFIER_ESCALATE_TOOLS`, and denies the rest:

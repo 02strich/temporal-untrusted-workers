@@ -1,4 +1,6 @@
 # Demo: untrusted Temporal workers making tool calls, judged by Cedar policies.
+# Each case shows the request Cedar evaluated (principal, action, resource,
+# context) and the policies that decided it, next to the policy file.
 #
 # Render with:   cd demos/cedar-tool-calls && vhs demo.tape
 # (Requires the Temporal CLI, Go, Rust and VHS; the stack is started by up.sh.)
@@ -6,9 +8,9 @@
 Output out/cedar-tool-calls.mp4
 
 Set Shell "bash"
-Set FontSize 17
-Set Width 1440
-Set Height 900
+Set FontSize 15
+Set Width 1600
+Set Height 1200
 Set Padding 24
 Set Theme "Catppuccin Mocha"
 Set WindowBar Colorful
@@ -44,30 +46,69 @@ Type "# The Cedar policy (comments stripped):"
 Enter
 Type "grep -v '^ *//' run/policy.cedar | cat -s"
 Enter
-Sleep 9s
+Sleep 10s
 Type "clear" Enter
 
-# --- allowed calls --------------------------------------------------------------
-Type "# Calls the policy permits reach the trusted handlers:"
+# --- allowed: the address is in the workflow's input ----------------------------
+Type "# Each workflow starts with the customer's email (alice@example.com) as input,"
 Enter
-Type "demo run echo charge-ok email-ok"
+Type "# which the proxy records with the verifier: it shows up in context.workflowInput."
+Enter
+Type "# send-email-to-customer permits emails to that customer:"
+Enter
+Type "demo run email-ok"
 Enter
 Wait+Screen@60s /email sent to alice/
-Sleep 4s
+Sleep 7s
+Type "clear" Enter
 
-# --- blocked calls --------------------------------------------------------------
-Type "# Others are escalated for human review, or denied outright:"
+# --- denied: an address the workflow never received -----------------------------
+Type "# Another address - as if a prompt injection steered the workflow there -"
 Enter
-Type "demo run charge-big charge-huge email-bad"
+Type "# isn't the workflow input's customerEmail, so no policy permits the email:"
+Enter
+Type "demo run email-bad"
 Enter
 Wait+Screen@60s /SendEmail not permitted/
-Sleep 4s
+Sleep 7s
+Type "clear" Enter
+
+# --- escalated: parameters drive the decision -----------------------------------
+Type "# Parameters count too: arg0.data.amount is over 1000, so the forbid annotated"
+Enter
+Type `# @decision("escalate") sends this charge to human review:`
+Enter
+Type "demo run charge-big"
+Enter
+Wait+Screen@60s /pending human review/
+Sleep 7s
+Type "clear" Enter
+
+# --- signals: an approval for a later action -------------------------------------
+Type "# Signals are input events too. A manager approves refund R-1001 by signaling the"
+Enter
+Type "# workflow; refund-needs-approval checks context.events.signal.approval:"
+Enter
+Type "demo run refund-approved"
+Enter
+Wait+Screen@60s /refunded R-1001/
+Sleep 8s
+Type "clear" Enter
+
+Type "# Without that signal the refund is denied - even though R-1001 is in the"
+Enter
+Type "# workflow's own input: only an approval signal counts:"
+Enter
+Type "demo run refund-unapproved"
+Enter
+Wait+Screen@60s /IssueRefund not permitted/
+Sleep 8s
 Type "clear" Enter
 
 # --- local rules ----------------------------------------------------------------
 Type "# Child workflows must stay on the worker's own task queue."
 Enter
-Type "# The proxy enforces that itself; the verifier is never asked:"
+Type "# The proxy enforces that itself; Cedar is never asked:"
 Enter
 Type "demo run child-cross"
 Enter
@@ -78,21 +119,16 @@ Type "clear" Enter
 # --- change the policy live -----------------------------------------------------
 Type "# Policies, not code: raise the review threshold to 10000 ..."
 Enter
-Type "sed -i '' 's/<= 1000$/<= 10000/' run/policy.cedar"
-Enter
-Type "grep -A6 '@decision' run/policy.cedar"
-Enter
-Sleep 3s
-Type "./restart-verifier.sh"
+Type "sed -i '' 's/<= 1000$/<= 10000/' run/policy.cedar && ./restart-verifier.sh"
 Enter
 Wait+Screen@30s /reloaded/
 Sleep 1s
-Type "# ... and the same 5000 charge now goes through:"
+Type "# ... and the same context now passes the escalation policy:"
 Enter
 Type "demo run charge-big"
 Enter
 Wait+Screen@60s /charged 5000/
-Sleep 5s
+Sleep 7s
 
 # --- teardown (not recorded) ------------------------------------------------------
 Hide

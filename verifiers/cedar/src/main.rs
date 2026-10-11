@@ -6,6 +6,7 @@
 //! evaluates each `VerifyToolCalls` start request with [`policy::PolicyEngine`],
 //! and completes it synchronously with a `VerifyToolCallsResponse`.
 
+mod inputs;
 mod policy;
 
 use std::{collections::HashMap, env, sync::Arc, time::Duration};
@@ -31,13 +32,16 @@ use temporalio_sdk_core::{
 };
 use tokio::task::JoinSet;
 
-use crate::policy::{PolicyEngine, Verdict};
+use crate::inputs::InputStore;
+use crate::policy::PolicyEngine;
 
 /// How long to wait for a graceful worker shutdown before exiting anyway.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
-const RESPONSE_MESSAGE_TYPE: &str =
+const VERIFY_RESPONSE_MESSAGE_TYPE: &str =
     "temporal_untrusted_workers.toolpolicy.v1.VerifyToolCallsResponse";
+const RECORD_RESPONSE_MESSAGE_TYPE: &str =
+    "temporal_untrusted_workers.toolpolicy.v1.RecordInputEventsResponse";
 
 struct Config {
     address: String,
@@ -45,7 +49,9 @@ struct Config {
     api_key: Option<String>,
     task_queue: String,
     service: String,
-    operation: String,
+    verify_operation: String,
+    record_operation: String,
+    input_max_runs: usize,
     policy_file: String,
     schema_file: Option<String>,
 }
@@ -59,7 +65,11 @@ impl Config {
             api_key: env::var("TEMPORAL_API_KEY").ok().filter(|k| !k.is_empty()),
             task_queue: get("VERIFIER_TASK_QUEUE", "tool-verifier"),
             service: get("VERIFIER_SERVICE", "tool-policy"),
-            operation: get("VERIFIER_OPERATION", "VerifyToolCalls"),
+            verify_operation: get("VERIFIER_VERIFY_OPERATION", "VerifyToolCalls"),
+            record_operation: get("VERIFIER_RECORD_OPERATION", "RecordInputEvents"),
+            input_max_runs: get("VERIFIER_INPUT_MAX_RUNS", "10000")
+                .parse()
+                .unwrap_or(10_000),
             policy_file: get("CEDAR_POLICY_FILE", "policies/example.cedar"),
             schema_file: env::var("CEDAR_SCHEMA_FILE").ok().filter(|f| !f.is_empty()),
         }
@@ -69,8 +79,10 @@ impl Config {
 /// Handles one Nexus task; shared by all task-handling Tokio tasks.
 struct Handler {
     engine: PolicyEngine,
+    inputs: InputStore,
     service: String,
-    operation: String,
+    verify_operation: String,
+    record_operation: String,
 }
 
 #[tokio::main]
@@ -101,7 +113,8 @@ async fn main() -> anyhow::Result<()> {
         namespace = %cfg.namespace,
         task_queue = %cfg.task_queue,
         service = %cfg.service,
-        operation = %cfg.operation,
+        verify_operation = %cfg.verify_operation,
+        record_operation = %cfg.record_operation,
         policy_file = %cfg.policy_file,
         schema_validated = cfg.schema_file.is_some(),
         "cedar-verifier running"
@@ -109,8 +122,10 @@ async fn main() -> anyhow::Result<()> {
 
     let handler = Arc::new(Handler {
         engine,
+        inputs: InputStore::new(cfg.input_max_runs),
         service: cfg.service,
-        operation: cfg.operation,
+        verify_operation: cfg.verify_operation,
+        record_operation: cfg.record_operation,
     });
     let worker = Arc::new(worker);
     // Only a weak handle stays here, so serve() can take sole ownership of the
@@ -241,20 +256,33 @@ impl Handler {
     }
 
     fn start_operation(&self, start: StartOperationRequest) -> nexus_task_completion::Status {
-        if start.service != self.service || start.operation != self.operation {
-            return handler_error(
-                "NOT_FOUND",
-                &format!("unknown operation {}/{}", start.service, start.operation),
-            );
+        if start.service == self.service && start.operation == self.verify_operation {
+            return self.verify_tool_calls(start);
         }
+        if start.service == self.service && start.operation == self.record_operation {
+            return self.record_input_events(start);
+        }
+        handler_error(
+            "NOT_FOUND",
+            &format!("unknown operation {}/{}", start.service, start.operation),
+        )
+    }
+
+    /// Decides a `VerifyToolCallsRequest`, with the run's recorded input
+    /// events as context.
+    fn verify_tool_calls(&self, start: StartOperationRequest) -> nexus_task_completion::Status {
         let input = start.payload.map(|p| p.data).unwrap_or_default();
-        let verdict = match serde_json::from_slice(&input)
+        let verdict = match serde_json::from_slice::<serde_json::Value>(&input)
             .map_err(anyhow::Error::from)
-            .and_then(|request| self.engine.verify(&request))
-        {
+            .and_then(|request| {
+                let inputs = self
+                    .inputs
+                    .context_for(request.get("caller").unwrap_or(&serde_json::Value::Null));
+                self.engine.verify(&request, &inputs)
+            }) {
             Ok(verdict) => verdict,
             Err(err) => {
-                tracing::warn!(error = %format!("{err:#}"), "rejecting malformed verify request");
+                tracing::warn!(error = %format!("{err:#}"), "rejecting malformed tool calls");
                 return handler_error(
                     "BAD_REQUEST",
                     &format!("invalid VerifyToolCallsRequest: {err:#}"),
@@ -268,32 +296,59 @@ impl Handler {
                 "tool calls not approved"
             );
         }
-        nexus_task_completion::Status::Completed(Response {
-            variant: Some(response::Variant::StartOperation(StartOperationResponse {
-                variant: Some(start_operation_response::Variant::SyncSuccess(
-                    start_operation_response::Sync {
-                        payload: Some(response_payload(&verdict)),
-                        links: vec![],
-                    },
-                )),
-            })),
-        })
+        let body = serde_json::json!({
+            "decision": verdict.decision.proto_name(),
+            "reason": verdict.reason,
+        });
+        sync_success(json_proto_payload(&body, VERIFY_RESPONSE_MESSAGE_TYPE))
+    }
+
+    /// Stores a `RecordInputEventsRequest`'s events for its run. They are
+    /// never judged, only used as context for the run's later tool calls.
+    fn record_input_events(&self, start: StartOperationRequest) -> nexus_task_completion::Status {
+        let input = start.payload.map(|p| p.data).unwrap_or_default();
+        match serde_json::from_slice::<serde_json::Value>(&input)
+            .map_err(anyhow::Error::from)
+            .and_then(|request| self.inputs.record(&request))
+        {
+            Ok(added) => {
+                tracing::debug!(added, "input events recorded");
+                sync_success(json_proto_payload(
+                    &serde_json::json!({}),
+                    RECORD_RESPONSE_MESSAGE_TYPE,
+                ))
+            }
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "rejecting malformed input events");
+                handler_error(
+                    "BAD_REQUEST",
+                    &format!("invalid RecordInputEventsRequest: {err:#}"),
+                )
+            }
+        }
     }
 }
 
-/// Encodes a verdict as a `VerifyToolCallsResponse` in the protobuf JSON mapping.
-fn response_payload(verdict: &Verdict) -> Payload {
-    let body = serde_json::json!({
-        "decision": verdict.decision.proto_name(),
-        "reason": verdict.reason,
-    });
+fn sync_success(payload: Payload) -> nexus_task_completion::Status {
+    nexus_task_completion::Status::Completed(Response {
+        variant: Some(response::Variant::StartOperation(StartOperationResponse {
+            variant: Some(start_operation_response::Variant::SyncSuccess(
+                start_operation_response::Sync {
+                    payload: Some(payload),
+                    links: vec![],
+                },
+            )),
+        })),
+    })
+}
+
+/// Encodes body (a message in the protobuf JSON mapping) as a "json/protobuf"
+/// payload of message_type.
+fn json_proto_payload(body: &serde_json::Value, message_type: &str) -> Payload {
     Payload {
         metadata: HashMap::from([
             ("encoding".to_owned(), b"json/protobuf".to_vec()),
-            (
-                "messageType".to_owned(),
-                RESPONSE_MESSAGE_TYPE.as_bytes().to_vec(),
-            ),
+            ("messageType".to_owned(), message_type.as_bytes().to_vec()),
         ]),
         data: body.to_string().into_bytes(),
         ..Default::default()

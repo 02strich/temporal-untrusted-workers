@@ -214,12 +214,12 @@ func TestDefault(t *testing.T) {
 	nexus := FromCommands([]*commandpb.Command{nexusCommand(&commonpb.Payload{
 		Metadata: map[string][]byte{"encoding": []byte("binary/protobuf"), "messageType": []byte("acme.v1.Secret")},
 	})}, "queue-a")
-	if err := (Default{}).Verify(context.Background(), Request{TaskQueue: "queue-a", Calls: nexus}); err != nil {
+	if err := (Default{}).Verify(context.Background(), Request{Caller: Caller{TaskQueue: "queue-a"}, Calls: nexus}); err != nil {
 		t.Fatalf("Default must allow Nexus calls (even unrenderable ones), got %v", err)
 	}
 
 	activity := FromCommands([]*commandpb.Command{activityCommand("trusted-tools")}, "queue-a")
-	err := (Default{}).Verify(context.Background(), Request{TaskQueue: "queue-a", Calls: activity})
+	err := (Default{}).Verify(context.Background(), Request{Caller: Caller{TaskQueue: "queue-a"}, Calls: activity})
 	var denied DeniedError
 	if !errors.As(err, &denied) {
 		t.Fatalf("Default must deny cross-queue activities, got %v", err)

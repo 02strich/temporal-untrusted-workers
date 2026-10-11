@@ -25,6 +25,9 @@ tool calls are allowed.
 | `context.workflowId` | The calling workflow's ID |
 | `context.parameterCount` | How many parameters the call has |
 | `context.parameters.argN` | Parameter N (`arg0`, `arg1`, …) as `{ type, data }` |
+| `context.workflowInput` | The workflow's start input: `{ name, parameters }` (see below) |
+| `context.events.<type>["<name>"]` | The latest activity result, Nexus result, signal or update of that name: `{ type, name, count, parameters }` |
+| `context.inputEventsComplete` | Whether the verifier has the run's input events from its start |
 
 Each tool is its own action, so [`policies/schema.cedarschema`](policies/schema.cedarschema)
 declares the shape of its parameters. Cedar denies by default, so a tool no policy permits,
@@ -62,6 +65,48 @@ JSON values become Cedar values as follows:
 In protobuf JSON, 64-bit integer fields of message types are strings (`"amount": "500"`), so declare
 them as `String` or use 32-bit fields.
 
+### Input events
+
+The proxy records each run's input events (the workflow input, activity and Nexus results, signals,
+updates) with the verifier's `RecordInputEvents` operation, before the worker sees them. The
+verifier keeps them per run, deduplicated by event ID or update ID, and exposes them as context:
+- `context.workflowInput` is the workflow's start input: `{ name, parameters }`, where `name` is the
+  workflow type.
+- `context.events` holds everything the run received after it started, by type: `activity`,
+  `nexus`, `signal` and `update`, each a record keyed by name. An entry is
+  `{ type, name, count, parameters }` for the **latest** event of that type and name, and `count`
+  says how many there were.
+
+Every entry's `parameters` has the same structure as the tool call's own parameters,
+`{ arg0: { type, data }, … }`, with the payload's full content in `data`. So a policy can compare a
+tool call's parameter with a specific field of a specific input:
+
+```cedar
+// Only email the customer the workflow was started for.
+context.parameters.arg0.data.value == context.workflowInput.parameters.arg0.data.customerEmail
+
+// Only refund what the latest `approval` signal named. Signals are sent from outside the
+// workflow, so this is a human's approval, not something the workflow decided.
+context.events.signal has approval &&
+context.parameters.arg0.data.value == context.events.signal.approval.parameters.arg0.data.refundId
+
+// Activity and Nexus names contain "/", so quote them.
+context.events.activity has "crm/LookupCustomer" &&
+context.parameters.arg0.data.value == context.events.activity["crm/LookupCustomer"].parameters.arg0.data.email
+```
+
+Cedar can only read declared fields, so declare the workflow input, and each event name your
+policies use with its parameters, in the schema (`WorkflowInput` and `Events` in
+[`schema.cedarschema`](policies/schema.cedarschema)). Mark the names and fields optional and check
+them with `has`, so a missing event or field fails closed instead of erroring.
+
+- `context.inputEventsComplete` is true once the verifier has received the run's events from its
+  first history event. Policies that rely on input events should require it, so a verifier restart
+  fails closed instead of trusting partial context.
+
+The store is in memory and bounded (`VERIFIER_INPUT_MAX_RUNS`), so a restart loses it. Run a single
+verifier instance: with several, each sees only the events delivered to it.
+
 ## The example policy
 
 [`policies/example.cedar`](policies/example.cedar) allows:
@@ -71,7 +116,11 @@ them as `String` or use 32-bit fields.
   - above 1000 it is escalated for review (`charge-over-1000-needs-review`, a `forbid` annotated
     `@decision("escalate")`);
   - above 10000, or without an amount, it is denied (`charge-limit-10000`);
-- the activity `trusted-tools/SendEmail`, only to `@example.com` addresses.
+- the activity `trusted-tools/IssueRefund`, only for a refund an `approval` signal named
+  (`refund-needs-approval`);
+- the activity `trusted-tools/SendEmail`, only to the customer the workflow was started for
+  (`send-email-to-customer`: the recipient must equal `workflowInput`'s `customerEmail`, and the
+  context must be complete).
 
 ## Declaring a tool
 
@@ -123,10 +172,17 @@ Then point the proxy at it with `TEMPORAL_PROXY_TOOL_VERIFIER=nexus` and
 | `TEMPORAL_API_KEY` | — | Optional API key; enables TLS. |
 | `VERIFIER_TASK_QUEUE` | `tool-verifier` | Task queue the endpoint targets. |
 | `VERIFIER_SERVICE` | `tool-policy` | Nexus service name. |
-| `VERIFIER_OPERATION` | `VerifyToolCalls` | Nexus operation name. |
+| `VERIFIER_VERIFY_OPERATION` | `VerifyToolCalls` | Nexus operation that decides tool calls. |
+| `VERIFIER_RECORD_OPERATION` | `RecordInputEvents` | Nexus operation that receives input events. |
+| `VERIFIER_INPUT_MAX_RUNS` | `10000` | Runs whose input events are kept in memory. |
 | `CEDAR_POLICY_FILE` | `policies/example.cedar` | Policies to enforce. |
 | `CEDAR_SCHEMA_FILE` | — | If set, policies are validated against this schema at startup, and the verifier refuses to start on errors. Recommended. |
 | `RUST_LOG` | `info` | Log filter. |
+
+To see what a policy was evaluated against, run with `RUST_LOG=info,cedar_request=debug`. The
+verifier then logs one JSON line per tool call. Each line holds the principal, action, resource, the
+exact `context`, the decision, and the `@id`s of the policies that decided it. The demo uses this to
+show the evaluated request under each case.
 
 The verifier fails closed in the proxy's favor:
 - Input it can't interpret is answered with a Nexus `BAD_REQUEST` handler error, which the proxy
