@@ -7,6 +7,7 @@ with [VHS](https://github.com/charmbracelet/vhs).
 | Demo | Shows |
 |------|-------|
 | [cedar-tool-calls](cedar-tool-calls) | Untrusted workflows calling trusted tools (Nexus operations, activities on other task queues), allowed or blocked by Cedar policies; the proxy's own same-queue rule; a live policy edit. |
+| [dogwood-tool-calls](dogwood-tool-calls) | The same cases, decided by Dogwood policies that look back on what each workflow run received (its input, an approval signal), kept in a durable history. |
 
 ## Running a demo
 
@@ -21,7 +22,7 @@ vhs demo.tape          # or render the scripted walkthrough to out/
 ```
 
 Requirements: Go and the [Temporal CLI](https://docs.temporal.io/cli). Some demos need more, such
-as Rust for the Cedar verifier. Rendering needs VHS (`brew install vhs`). Logs, PIDs and built
+as Rust for the Cedar and Dogwood verifiers. Rendering needs VHS (`brew install vhs`). Logs, PIDs and built
 binaries go to `<demo>/run/` and recordings to `<demo>/out/`; both are git-ignored.
 
 ## Layout
@@ -30,6 +31,7 @@ binaries go to `<demo>/run/` and recordings to `<demo>/out/`; both are git-ignor
 demos/
   go.mod                  one Go module for every demo harness
   internal/demokit/       shared Go helpers: quiet clients, proxy client, allowed/blocked case runner
+  internal/toolcalls/     the tool-call demos' workers, workflows and cases (cedar- and dogwood-tool-calls)
   lib/stack.sh            shared shell helpers: dev server, Nexus endpoints, proxy, background processes
   <demo>/
     main.go               the demo's harness (package main), built by up.sh as run/demo
@@ -42,7 +44,7 @@ demos/
 ## Adding a demo
 
 1. Create `demos/<name>/` with an `env.sh` that sets `DEMO_DIR`, picks an unused `DEMO_PORT_BASE`
-   (taken so far: 47000), and sources `../lib/stack.sh`.
+   (taken so far: 47000, 51000), and sources `../lib/stack.sh`.
 2. Write `up.sh` from the `lib/stack.sh` building blocks: `stack_init`, `build_harness`,
    `build_proxy`, `start_temporal`, `create_endpoint`, `start_proxy`, `bg`, and `step` for progress
    output. `down.sh` is just `stack_down`.

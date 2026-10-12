@@ -1,0 +1,61 @@
+// Example tool-call policy. The proxy already keeps child workflows and
+// continue-as-new on the worker's own task queue; these policies decide which
+// calls leaving it - Nexus operations and activities on other task queues -
+// are allowed. Dogwood denies anything no policy permits.
+
+// The echo Nexus operation is harmless: allow it for every worker.
+@id("allow-echo")
+permit (principal, action == Temporal::Action::"echo/echo/Echo", resource);
+
+// Charges are allowed in USD and EUR...
+@id("charge-in-usd-or-eur")
+permit (principal, action == Temporal::Action::"payments/billing/Charge", resource)
+when {
+  context.input has arg0 &&
+  context.input.arg0 has currency &&
+  ["USD", "EUR"].contains(context.input.arg0.currency)
+};
+
+// ...charges above 1000 need a human's approval (a forbid annotated
+// @decision("escalate") answers DECISION_ESCALATE instead of DECISION_DENIED)...
+@id("charge-over-1000-needs-review")
+@decision("escalate")
+forbid (principal, action == Temporal::Action::"payments/billing/Charge", resource)
+unless {
+  context.input has arg0 &&
+  context.input.arg0 has amount &&
+  context.input.arg0.amount <= 1000
+};
+
+// ...and charges above 10000, or without an amount, are never allowed.
+@id("charge-limit-10000")
+forbid (principal, action == Temporal::Action::"payments/billing/Charge", resource)
+unless {
+  context.input has arg0 &&
+  context.input.arg0 has amount &&
+  context.input.arg0.amount <= 10000
+};
+
+// The SendEmail activity, hosted by trusted workers on the trusted-tools task
+// queue, may only email the customer the workflow was started for - not an
+// address an injected prompt made up: the run must have received a workflow
+// input whose customerEmail is the recipient.
+@id("send-email-to-customer")
+permit (principal, action == Temporal::Action::"trusted-tools/SendEmail", resource)
+when temporal {
+  formerly within 30d Temporal::Action::"workflow/ToolWorkflow"::received{
+    input.arg0.customerEmail: context.input.arg0
+  }
+};
+
+// IssueRefund needs a human's approval, given to the workflow as an
+// `approval` signal naming the refund (e.g. {"refundId": "R-1001",
+// "approvedBy": "manager@example.com"}). The workflow can't approve itself:
+// signals are sent from outside it.
+@id("refund-needs-approval")
+permit (principal, action == Temporal::Action::"trusted-tools/IssueRefund", resource)
+when temporal {
+  formerly within 30d Temporal::Action::"signal/approval"::received{
+    input.arg0.refundId: context.input.arg0
+  }
+};

@@ -322,6 +322,11 @@ TEMPORAL_PROXY_TOOL_VERIFIER_NEXUS_SERVICE=tool-policy \
 in USD or EUR" are policies rather than code. It uses the same endpoint and environment variables as
 `cmd/example-verifier`.
 
+[`verifiers/dogwood`](verifiers/dogwood) does the same with [Dogwood](https://github.com/dogwood-policy/dogwood)
+policies: Cedar plus temporal conditions over what each workflow run has received, such as "only
+refund what an `approval` signal named". It keeps that history in a durable store, so it survives
+verifier restarts. Both verifiers share the Nexus worker in [`verifiers/host`](verifiers/host).
+
 Run the verifier on trusted infrastructure, never behind the proxy itself: it decides what
 untrusted workers may do.
 
@@ -331,7 +336,8 @@ untrusted workers may do.
 
 [`demos/`](demos) has scripted, recordable walkthroughs that each run a complete local stack. For
 example, [`demos/cedar-tool-calls`](demos/cedar-tool-calls) shows untrusted workflows calling
-trusted tools, allowed or blocked by Cedar policies.
+trusted tools, allowed or blocked by Cedar policies, and
+[`demos/dogwood-tool-calls`](demos/dogwood-tool-calls) shows the same cases decided by Dogwood.
 
 ---
 

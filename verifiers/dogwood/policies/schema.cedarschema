@@ -1,0 +1,93 @@
+// Dogwood action schema for the temporal-proxy tool-call verifier.
+//
+// Every tool call - a Nexus operation, or an activity on another task queue -
+// is a `request` event (a decision point) of its own action:
+//   principal: Temporal::Worker::"<subject>", the worker identity
+//   action:    Temporal::Action::"<endpoint>/<service>/<operation>" or
+//              Temporal::Action::"<taskQueue>/<activityType>"
+//   resource:  Temporal::TaskQueue::"<queue>", the calling workflow's task queue
+//
+// Everything the run receives is recorded as a `received` event (history,
+// no decision), which temporal policies can look back on:
+//   the workflow input        Temporal::Action::"workflow/<WorkflowType>"
+//   a signal / an update      Temporal::Action::"signal/<name>" / "update/<name>"
+//   an activity / Nexus result  the tool's own action, e.g. "trusted-tools/SendEmail"
+//
+// Every event's context is { input, caller }:
+//   input.parameterCount  how many parameters (or payloads) it has
+//   input.argN            parameter N: a plain JSON value as itself, an
+//                         object (or a protobuf message) as a record
+//   caller                the calling workflow run (see Caller)
+// Each event action must be declared here with the shape of its parameters.
+// Events of undeclared actions are still recorded, but no policy can refer to
+// them, and a tool call of an undeclared action is denied.
+namespace Temporal {
+  // The calling worker identity, keyed by its subject.
+  entity Worker;
+  // The task queue that issued the workflow task token being completed.
+  entity TaskQueue;
+
+  // The workflow run an event belongs to. Every temporal condition is limited
+  // to the run's own events (the event schema pins caller.run).
+  type Caller = {
+    namespace: String,
+    workflowId: String,
+    // "<namespace>/<workflowId>/<runId>"
+    run: String,
+    taskQueue: String,
+  };
+
+  // A tool taking a single plain JSON string, e.g. an SDK call with one
+  // string argument.
+  type StringInput = { parameterCount: Long, arg0?: String };
+
+  // payments/billing/Charge takes one JSON object.
+  type ChargeInput = {
+    parameterCount: Long,
+    arg0?: { amount?: Long, currency?: String },
+  };
+
+  action "echo/echo/Echo" appliesTo {
+    principal: [Worker], resource: [TaskQueue],
+    context: { input: StringInput, caller: Caller },
+  };
+
+  action "payments/billing/Charge" appliesTo {
+    principal: [Worker], resource: [TaskQueue],
+    context: { input: ChargeInput, caller: Caller },
+  };
+
+  action "trusted-tools/SendEmail" appliesTo {
+    principal: [Worker], resource: [TaskQueue],
+    context: { input: StringInput, caller: Caller },
+  };
+
+  action "trusted-tools/IssueRefund" appliesTo {
+    principal: [Worker], resource: [TaskQueue],
+    context: { input: StringInput, caller: Caller },
+  };
+
+  // The demo's ToolWorkflow takes one JSON object.
+  action "workflow/ToolWorkflow" appliesTo {
+    principal: [Worker], resource: [TaskQueue],
+    context: {
+      input: {
+        parameterCount: Long,
+        arg0?: { case?: String, customerEmail?: String, refundId?: String },
+      },
+      caller: Caller,
+    },
+  };
+
+  // An approval, e.g. {"refundId": "R-1001", "approvedBy": "manager@example.com"}.
+  action "signal/approval" appliesTo {
+    principal: [Worker], resource: [TaskQueue],
+    context: {
+      input: {
+        parameterCount: Long,
+        arg0?: { refundId?: String, approvedBy?: String },
+      },
+      caller: Caller,
+    },
+  };
+}

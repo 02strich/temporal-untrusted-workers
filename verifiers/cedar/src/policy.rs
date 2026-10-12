@@ -18,45 +18,7 @@ use cedar_policy::{
     EntityUid, PolicySet, Request, RestrictedExpression, Schema, ValidationMode, Validator,
 };
 use serde_json::{Map, Value};
-
-/// A `toolpolicy.v1.Decision`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Decision {
-    Approved,
-    Denied,
-    Escalate,
-}
-
-impl Decision {
-    /// The enum value's name in the protobuf JSON mapping.
-    pub fn proto_name(self) -> &'static str {
-        match self {
-            Decision::Approved => "DECISION_APPROVED",
-            Decision::Denied => "DECISION_DENIED",
-            Decision::Escalate => "DECISION_ESCALATE",
-        }
-    }
-}
-
-/// The verdict returned to the proxy as a `VerifyToolCallsResponse`.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Verdict {
-    pub decision: Decision,
-    pub reason: String,
-}
-
-impl Verdict {
-    fn approve() -> Self {
-        Self {
-            decision: Decision::Approved,
-            reason: String::new(),
-        }
-    }
-
-    pub fn allowed(&self) -> bool {
-        self.decision == Decision::Approved
-    }
-}
+use verifier_host::proto::{self, AnyData, Caller, Decision, Verdict, parse_any};
 
 /// One recorded input event: its name, how many events of that type and
 /// name the run received, and the latest one's payloads (protobuf JSON Anys).
@@ -126,16 +88,14 @@ impl PolicyEngine {
     /// Decides a `VerifyToolCallsRequest`, given in the protobuf JSON mapping.
     /// Errors mean the input could not be interpreted.
     pub fn verify(&self, request: &Value, inputs: &InputContext) -> anyhow::Result<Verdict> {
-        let caller = field(request, "caller", "caller").unwrap_or(&Value::Null);
-        let namespace = string_field(caller, "namespace", "namespace");
-        let subject = string_field(caller, "subject", "subject");
-        let task_queue = string_field(caller, "taskQueue", "task_queue");
-        let workflow_id = string_field(caller, "workflowId", "workflow_id");
-        let tool_calls = match field(request, "toolCalls", "tool_calls") {
-            None | Some(Value::Null) => &[][..],
-            Some(Value::Array(calls)) => calls.as_slice(),
-            Some(_) => bail!("toolCalls must be an array"),
-        };
+        let Caller {
+            namespace,
+            subject,
+            task_queue,
+            workflow_id,
+            ..
+        } = Caller::parse(request);
+        let tool_calls = proto::tool_calls(request)?;
 
         let principal = uid("Worker", &subject)?;
         let resource = uid("TaskQueue", &task_queue)?;
@@ -276,21 +236,17 @@ struct Parameter {
 }
 
 impl ToolCall {
-    fn parse(call: &Value) -> anyhow::Result<Self> {
-        let name = string_field(call, "name", "name");
-        if name.is_empty() {
-            bail!("tool call has no name");
-        }
-        let parameters = match call.get("parameters") {
-            None | Some(Value::Null) => Vec::new(),
-            Some(Value::Array(params)) => params
-                .iter()
-                .enumerate()
-                .map(|(i, p)| Parameter::parse(p).with_context(|| format!("parameter {i}")))
-                .collect::<anyhow::Result<_>>()?,
-            Some(_) => bail!("parameters must be an array"),
-        };
-        Ok(Self { name, parameters })
+    fn parse(call: &proto::ToolCall) -> anyhow::Result<Self> {
+        let parameters = call
+            .parameters
+            .iter()
+            .enumerate()
+            .map(|(i, p)| Parameter::parse(p).with_context(|| format!("parameter {i}")))
+            .collect::<anyhow::Result<_>>()?;
+        Ok(Self {
+            name: call.name.clone(),
+            parameters,
+        })
     }
 
     /// The Cedar context, and the same as JSON (for logging what Cedar
@@ -425,64 +381,6 @@ fn event_record(
     Ok((RestrictedExpression::new_record(fields)?, json))
 }
 
-/// Well-known types whose protobuf JSON form is not a plain object of fields;
-/// inside an Any they appear under a "value" key.
-const VALUE_FORM_TYPES: &[&str] = &[
-    "google.protobuf.Any",
-    "google.protobuf.Struct",
-    "google.protobuf.Value",
-    "google.protobuf.ListValue",
-    "google.protobuf.Timestamp",
-    "google.protobuf.Duration",
-    "google.protobuf.FieldMask",
-    "google.protobuf.DoubleValue",
-    "google.protobuf.FloatValue",
-    "google.protobuf.Int64Value",
-    "google.protobuf.UInt64Value",
-    "google.protobuf.Int32Value",
-    "google.protobuf.UInt32Value",
-    "google.protobuf.BoolValue",
-    "google.protobuf.StringValue",
-    "google.protobuf.BytesValue",
-];
-
-/// The proxy packs payloads it can't interpret (e.g. encrypted ones) as-is.
-const OPAQUE_PAYLOAD_TYPE: &str = "temporal.api.common.v1.Payload";
-
-/// The content of a google.protobuf.Any in protobuf JSON form.
-pub(crate) enum AnyData {
-    /// A payload the proxy couldn't interpret.
-    Opaque,
-    /// A well-known type in "value" form: the Any's `value`.
-    Value(Value),
-    /// A message type: its fields.
-    Fields(Map<String, Value>),
-}
-
-/// Splits the protobuf JSON form of a google.protobuf.Any into its type name
-/// (without the `type.googleapis.com/` prefix) and its content.
-pub(crate) fn parse_any(any: &Value) -> anyhow::Result<(String, AnyData)> {
-    let Some(object) = any.as_object() else {
-        bail!("expected a JSON object (a google.protobuf.Any)");
-    };
-    let type_url = object
-        .get("@type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("Any has no \"@type\""))?;
-    let type_name = type_url.rsplit('/').next().unwrap_or(type_url).to_owned();
-
-    let data = if type_name == OPAQUE_PAYLOAD_TYPE {
-        AnyData::Opaque
-    } else if VALUE_FORM_TYPES.contains(&type_name.as_str()) {
-        AnyData::Value(object.get("value").cloned().unwrap_or(Value::Null))
-    } else {
-        let mut fields = object.clone();
-        fields.remove("@type");
-        AnyData::Fields(fields)
-    };
-    Ok((type_name, data))
-}
-
 impl Parameter {
     /// Interprets the protobuf JSON form of a google.protobuf.Any.
     fn parse(any: &Value) -> anyhow::Result<Self> {
@@ -552,19 +450,6 @@ fn uid(entity_type: &str, id: &str) -> anyhow::Result<EntityUid> {
         EntityTypeName::from_str(entity_type)?,
         EntityId::new(id),
     ))
-}
-
-/// Looks up a field by its protobuf JSON name, falling back to the original
-/// proto field name (both are valid protobuf JSON input).
-fn field<'a>(value: &'a Value, camel: &str, snake: &str) -> Option<&'a Value> {
-    value.get(camel).or_else(|| value.get(snake))
-}
-
-fn string_field(value: &Value, camel: &str, snake: &str) -> String {
-    field(value, camel, snake)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned()
 }
 
 #[cfg(test)]
@@ -931,10 +816,12 @@ mod tests {
 
     #[test]
     fn context_json_matches_what_cedar_sees() {
-        let call = ToolCall::parse(&json!({
-            "name": "payments/billing/Charge",
-            "parameters": [value_param(json!({"amount": 500, "currency": "USD", "ratio": 0.5, "note": null}))],
-        }))
+        let call = ToolCall::parse(&proto::ToolCall {
+            name: "payments/billing/Charge".to_owned(),
+            parameters: vec![value_param(
+                json!({"amount": 500, "currency": "USD", "ratio": 0.5, "note": null}),
+            )],
+        })
         .unwrap();
         let inputs = with_signal(
             started_with(json!({"customerEmail": "alice@example.com"})),

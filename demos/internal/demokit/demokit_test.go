@@ -39,7 +39,7 @@ func TestRenderJSON_NestedIndent(t *testing.T) {
 	}
 }
 
-func TestCedarEvaluations(t *testing.T) {
+func TestVerifierEvaluations(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "verifier.log")
 	lines := "" +
 		"2026-10-11T08:00:00Z  INFO cedar_verifier: cedar-verifier running\n" +
@@ -54,11 +54,37 @@ func TestCedarEvaluations(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	evals := cedarEvaluations(path, 0, "wf-1")
+	evals := verifierEvaluations(path, "cedar_request", 0, "wf-1")
 	if len(evals) != 1 {
 		t.Fatalf("expected one evaluation for wf-1, got %+v", evals)
 	}
 	if ev := evals[0]; ev.Principal != `Worker::"fleet-a"` || ev.Action != `Action::"a/B"` || ev.Decision != "deny" || string(ev.Context) != `{"x":1}` {
 		t.Fatalf("unexpected evaluation %+v", ev)
+	}
+}
+
+func TestVerifierEvaluations_DogwoodHistory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "verifier.log")
+	lines := "" +
+		// A Cedar line in the same file is ignored for the Dogwood target.
+		`2026-10-11T08:00:00Z DEBUG cedar_request: {"workflowId":"wf-1","action":"x","decision":"deny"}` + "\n" +
+		`2026-10-11T08:00:01Z DEBUG dogwood_request: {"workflowId":"wf-1","principal":"Temporal::Worker::\"fleet-a\"",` +
+		`"action":"Temporal::Action::\"trusted-tools/IssueRefund\"","resource":"Temporal::TaskQueue::\"q\"","context":{"input":{"arg0":"R-1001"}},` +
+		`"history":[{"action":"Temporal::Action::\"signal/approval\"","input":{"arg0":{"refundId":"R-1001"}}}],` +
+		`"decision":"allow","policies":["refund-needs-approval"]}` + "\n"
+	if err := os.WriteFile(path, []byte(lines), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	evals := verifierEvaluations(path, "dogwood_request", 0, "wf-1")
+	if len(evals) != 1 {
+		t.Fatalf("expected one Dogwood evaluation for wf-1, got %+v", evals)
+	}
+	ev := evals[0]
+	if len(ev.History) != 1 || compactJSON(ev.History[0]) != `{"action": "Temporal::Action::\"signal/approval\"", "input": {"arg0": {"refundId": "R-1001"}}}` {
+		t.Fatalf("unexpected history %q", ev.History)
+	}
+	if len(ev.Policies) != 1 || ev.Policies[0] != "refund-needs-approval" {
+		t.Fatalf("unexpected policies %v", ev.Policies)
 	}
 }

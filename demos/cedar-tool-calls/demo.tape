@@ -20,7 +20,7 @@ Set TypingSpeed 30ms
 Hide
 Type "./down.sh; rm -rf run; source env.sh; export PS1='\[\e[36m\]$ \[\e[0m\]'" Enter
 # Warm the build caches so up.sh doesn't compile on camera.
-Type "(cd $REPO_DIR/verifiers/cedar && cargo build -q --release) && (cd $DEMOS_DIR && go build -o /dev/null ./cedar-tool-calls) && (cd $REPO_DIR && go build -o /dev/null ./cmd/temporal-proxy) && clear && echo ready" Enter
+Type "(cd $REPO_DIR/verifiers && cargo build -q --release -p cedar-verifier) && (cd $DEMOS_DIR && go build -o /dev/null ./cedar-tool-calls) && (cd $REPO_DIR && go build -o /dev/null ./cmd/temporal-proxy) && clear && echo ready" Enter
 Wait+Screen@600s /^ready/
 Type "clear" Enter
 Sleep 1s

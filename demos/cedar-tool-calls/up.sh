@@ -9,7 +9,7 @@ stack_init
 # Build everything quietly first.
 build_harness
 build_proxy
-(cd "$REPO_DIR/verifiers/cedar" && cargo build -q --release && cp target/release/cedar-verifier "$RUN_DIR/")
+(cd "$REPO_DIR/verifiers" && cargo build -q --release -p cedar-verifier && cp target/release/cedar-verifier "$RUN_DIR/")
 cp "$REPO_DIR/verifiers/cedar/policies/example.cedar" "$POLICY_FILE"
 
 start_temporal
@@ -21,7 +21,7 @@ create_endpoint tool-verifier tool-verifier
 step "Nexus endpoints                echo, payments, tool-verifier"
 
 (cd "$RUN_DIR" && bg handlers "$RUN_DIR/demo" handlers)
-step "Trusted handlers               Nexus echo + billing, activity SendEmail"
+step "Trusted handlers               Nexus echo + billing, activities SendEmail + IssueRefund"
 
 start_verifier
 step "Cedar verifier                 policy.cedar (schema-validated)"

@@ -1,7 +1,7 @@
 // Package demokit holds helpers shared by the demo harnesses under demos/:
 // Temporal clients without SDK log noise, and a runner that starts a workflow
 // and reports whether it completed or temporal-proxy blocked it - along with
-// the requests the Cedar verifier evaluated for it.
+// the requests the tool verifier (Cedar or Dogwood) evaluated for it.
 package demokit
 
 import (
@@ -60,14 +60,18 @@ type Logs struct {
 	// Proxy is temporal-proxy's log; blocks are detected from its
 	// "access denied" lines.
 	Proxy string
-	// Verifier, if set, is the Cedar verifier's log, written with
-	// RUST_LOG=cedar_request=debug. RunCase then shows the requests Cedar
+	// Verifier, if set, is the tool verifier's log, written with
+	// RUST_LOG=<Target>=debug. RunCase then shows the requests the verifier
 	// evaluated for the case: principal, action, resource and context.
 	Verifier string
+	// Target is the verifier's evaluation log target, e.g. "cedar_request".
+	Target string
+	// Engine names the verifier's policy engine in the output, e.g. "Cedar".
+	Engine string
 }
 
 // RunCase starts the case's workflow and prints whether it completed or
-// temporal-proxy blocked it, preceded by what Cedar evaluated (if
+// temporal-proxy blocked it, preceded by what the verifier evaluated (if
 // logs.Verifier is set). A block is detected from the first "access denied"
 // line the proxy logs after the start; the blocked workflow is then
 // terminated so its worker stops retrying.
@@ -81,7 +85,7 @@ func RunCase(c client.Client, logs Logs, workflowID string, tc Case) {
 
 	outcome := waitForOutcome(c, wf, logs.Proxy, proxyOffset, workflowID)
 	if logs.Verifier != "" {
-		printEvaluations(cedarEvaluations(logs.Verifier, verifierOffset, workflowID))
+		printEvaluations(logs.Engine, verifierEvaluations(logs.Verifier, logs.Target, verifierOffset, workflowID))
 	}
 	fmt.Printf("%s\n\n", outcome)
 }
@@ -113,24 +117,28 @@ func waitForOutcome(c client.Client, wf client.WorkflowRun, proxyLog string, off
 	}
 }
 
-// evaluation is one cedar_request line logged by the Cedar verifier.
+// evaluation is one evaluation line logged by a tool verifier.
 type evaluation struct {
 	WorkflowID string          `json:"workflowId"`
 	Principal  string          `json:"principal"`
 	Action     string          `json:"action"`
 	Resource   string          `json:"resource"`
 	Context    json.RawMessage `json:"context"`
-	Decision   string          `json:"decision"`
+	// History, logged by the Dogwood verifier, are the latest events the
+	// run received, which temporal conditions look back on.
+	History  []json.RawMessage `json:"history"`
+	Decision string            `json:"decision"`
 	// Policies are the @ids of the policies that determined the decision.
 	Policies []string `json:"policies"`
 }
 
 var ansiEscape = regexp.MustCompile("\x1b\\[[0-9;]*m")
 
-// cedarEvaluations returns the requests Cedar evaluated for workflowID after
-// offset, one per action: a blocked workflow task is retried, but its first
-// evaluation shows what was decided.
-func cedarEvaluations(path string, offset int64, workflowID string) []evaluation {
+// verifierEvaluations returns the requests the verifier evaluated for
+// workflowID after offset, from its log lines of target, one per action: a
+// blocked workflow task is retried, but its first evaluation shows what was
+// decided.
+func verifierEvaluations(path, target string, offset int64, workflowID string) []evaluation {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil
@@ -145,7 +153,7 @@ func cedarEvaluations(path string, offset int64, workflowID string) []evaluation
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for sc.Scan() {
 		line := ansiEscape.ReplaceAllString(sc.Text(), "")
-		i := strings.Index(line, "cedar_request:")
+		i := strings.Index(line, target+":")
 		if i < 0 {
 			continue
 		}
@@ -163,14 +171,14 @@ func cedarEvaluations(path string, offset int64, workflowID string) []evaluation
 	return evals
 }
 
-func printEvaluations(evals []evaluation) {
+func printEvaluations(engine string, evals []evaluation) {
 	if len(evals) == 0 {
-		fmt.Printf("  %s(Cedar wasn't asked: nothing reached the verifier)%s\n", dim, reset)
+		fmt.Printf("  %s(%s wasn't asked: nothing reached the verifier)%s\n", dim, engine, reset)
 		return
 	}
 	bar := dim + "│" + reset
 	for _, ev := range evals {
-		fmt.Printf("  %s┌ Cedar request%s\n", dim, reset)
+		fmt.Printf("  %s┌ %s request%s\n", dim, engine, reset)
 		fmt.Printf("  %s %sprincipal%s  %s\n", bar, dim, reset, ev.Principal)
 		fmt.Printf("  %s %saction%s     %s\n", bar, dim, reset, ev.Action)
 		fmt.Printf("  %s %sresource%s   %s\n", bar, dim, reset, ev.Resource)
@@ -180,6 +188,13 @@ func printEvaluations(evals []evaluation) {
 			} else {
 				fmt.Printf("  %s            %s\n", bar, line)
 			}
+		}
+		for k, event := range ev.History {
+			label := "         "
+			if k == 0 {
+				label = "history  "
+			}
+			fmt.Printf("  %s %s%s%s  %s\n", bar, dim, label, reset, compactJSON(event))
 		}
 		decidedBy := "by " + strings.Join(ev.Policies, ", ")
 		if len(ev.Policies) == 0 {

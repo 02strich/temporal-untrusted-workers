@@ -9,10 +9,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
-use anyhow::bail;
 use serde_json::Value;
+use verifier_host::proto::{Caller, InputEvents};
 
-use crate::policy::{InputContext, RecordedEvent, parse_any};
+use crate::policy::{InputContext, RecordedEvent};
 
 /// What the store keeps per run: the workflow's start input, and the latest
 /// event of each type (activity, nexus, signal, update) and name.
@@ -50,24 +50,14 @@ impl InputStore {
     /// already recorded for the run (same event ID or update ID) are skipped.
     /// Returns the number of new events.
     pub fn record(&self, request: &Value) -> anyhow::Result<usize> {
-        let key = run_key(request.get("caller").unwrap_or(&Value::Null));
-        let events = match request.get("events") {
-            None | Some(Value::Null) => &[][..],
-            Some(Value::Array(events)) => events.as_slice(),
-            Some(_) => bail!("events must be an array"),
-        };
-        let from_start = request
-            .get("fromHistoryStart")
-            .or_else(|| request.get("from_history_start"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-
         // Parse everything before touching the store, so a malformed request
         // records nothing.
-        let mut parsed = Vec::with_capacity(events.len());
-        for event in events {
-            parsed.push(ParsedEvent::parse(event)?);
-        }
+        let InputEvents {
+            caller,
+            from_history_start: from_start,
+            events: parsed,
+        } = InputEvents::parse(request)?;
+        let key = caller.run_key();
 
         let mut inner = self.inner.lock().expect("input store lock");
         if !inner.runs.contains_key(&key) {
@@ -119,9 +109,9 @@ impl InputStore {
 
     /// The input context for the run a `VerifyToolCallsRequest`'s caller
     /// identifies; empty and incomplete if nothing was recorded for it.
-    pub fn context_for(&self, caller: &Value) -> InputContext {
+    pub fn context_for(&self, caller: &Caller) -> InputContext {
         let inner = self.inner.lock().expect("input store lock");
-        match inner.runs.get(&run_key(caller)) {
+        match inner.runs.get(&caller.run_key()) {
             Some(run) => InputContext {
                 workflow_input: run.workflow_input.clone(),
                 events: run.events.clone(),
@@ -132,100 +122,6 @@ impl InputStore {
     }
 }
 
-fn run_key(caller: &Value) -> String {
-    let get = |camel: &str, snake: &str| {
-        caller
-            .get(camel)
-            .or_else(|| caller.get(snake))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned()
-    };
-    format!(
-        "{}/{}/{}",
-        get("namespace", "namespace"),
-        get("workflowId", "workflow_id"),
-        get("runId", "run_id")
-    )
-}
-
-struct ParsedEvent {
-    kind: String,
-    name: String,
-    // The payloads as protobuf JSON Anys, checked to be well-formed.
-    payloads: Vec<Value>,
-    event_id: Option<i64>,
-    update_id: Option<String>,
-}
-
-impl ParsedEvent {
-    fn parse(event: &Value) -> anyhow::Result<Self> {
-        let kind = match event.get("kind") {
-            Some(Value::String(s)) => short_kind(s),
-            Some(Value::Number(n)) => short_kind_number(n.as_i64().unwrap_or(0)),
-            _ => bail!("input event has no kind"),
-        };
-        let name = event
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        // int64 fields are strings in the protobuf JSON mapping; accept numbers too.
-        let event_id = match event.get("eventId").or_else(|| event.get("event_id")) {
-            Some(Value::String(s)) => Some(s.parse::<i64>()?),
-            Some(Value::Number(n)) => n.as_i64(),
-            _ => None,
-        }
-        .filter(|id| *id != 0);
-        let update_id = event
-            .get("updateId")
-            .or_else(|| event.get("update_id"))
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
-
-        let payloads = match event.get("payloads") {
-            Some(Value::Array(payloads)) => payloads.clone(),
-            _ => Vec::new(),
-        };
-        for payload in &payloads {
-            parse_any(payload)?;
-        }
-        Ok(Self {
-            kind,
-            name,
-            payloads,
-            event_id,
-            update_id,
-        })
-    }
-}
-
-/// Maps an `InputEventKind` enum name to the short kind policies use.
-fn short_kind(name: &str) -> String {
-    match name {
-        "INPUT_EVENT_KIND_WORKFLOW_INPUT" => "workflow",
-        "INPUT_EVENT_KIND_ACTIVITY_RESULT" => "activity",
-        "INPUT_EVENT_KIND_NEXUS_OPERATION_RESULT" => "nexus",
-        "INPUT_EVENT_KIND_SIGNAL" => "signal",
-        "INPUT_EVENT_KIND_UPDATE" => "update",
-        _ => "unknown",
-    }
-    .to_owned()
-}
-
-fn short_kind_number(n: i64) -> String {
-    match n {
-        1 => "workflow",
-        2 => "activity",
-        3 => "nexus",
-        4 => "signal",
-        5 => "update",
-        _ => "unknown",
-    }
-    .to_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +129,11 @@ mod tests {
 
     fn caller(run: &str) -> Value {
         json!({"namespace": "ns", "workflowId": "wf", "runId": run})
+    }
+
+    /// The run caller(run) identifies.
+    fn run(run: &str) -> Caller {
+        Caller::parse(&json!({ "caller": caller(run) }))
     }
 
     fn value_param(value: Value) -> Value {
@@ -262,7 +163,7 @@ mod tests {
         // Re-sent events are skipped.
         assert_eq!(store.record(&batch).unwrap(), 0);
 
-        let ctx = store.context_for(&caller("r1"));
+        let ctx = store.context_for(&run("r1"));
         assert!(ctx.complete);
         let input = ctx.workflow_input.as_ref().unwrap();
         assert_eq!(input.name, "AgentWorkflow");
@@ -284,7 +185,7 @@ mod tests {
         );
 
         // Other runs are separate, and unknown runs are empty and incomplete.
-        let other = store.context_for(&caller("r2"));
+        let other = store.context_for(&run("r2"));
         assert!(!other.complete && other.workflow_input.is_none() && other.events.is_empty());
     }
 
@@ -297,7 +198,7 @@ mod tests {
                  "payloads": [value_param(json!("ok"))]},
             ]}))
             .unwrap();
-        let ctx = store.context_for(&caller("r1"));
+        let ctx = store.context_for(&run("r1"));
         assert!(!ctx.complete);
         assert!(ctx.workflow_input.is_none());
         assert_eq!(ctx.events["activity"]["crm/Lookup"].count, 1);
@@ -311,8 +212,8 @@ mod tests {
                 .record(&json!({"caller": caller(run), "fromHistoryStart": true}))
                 .unwrap();
         }
-        assert!(!store.context_for(&caller("r1")).complete, "r1 was evicted");
-        assert!(store.context_for(&caller("r3")).complete);
+        assert!(!store.context_for(&run("r1")).complete, "r1 was evicted");
+        assert!(store.context_for(&run("r3")).complete);
     }
 
     #[test]
@@ -323,6 +224,6 @@ mod tests {
             {"kind": "INPUT_EVENT_KIND_SIGNAL", "name": "bad", "eventId": "3", "payloads": [{"no": "type"}]},
         ]});
         assert!(store.record(&bad).is_err());
-        assert!(!store.context_for(&caller("r1")).complete);
+        assert!(!store.context_for(&run("r1")).complete);
     }
 }

@@ -158,7 +158,7 @@ verifier instance: with several, each sees only the events delivered to it.
 ```bash
 temporal operator nexus endpoint create --name tool-verifier \
   --target-namespace default --target-task-queue tool-verifier
-CEDAR_SCHEMA_FILE=policies/schema.cedarschema cargo run --release
+CEDAR_SCHEMA_FILE=policies/schema.cedarschema cargo run --release -p cedar-verifier
 ```
 
 Then point the proxy at it with `TEMPORAL_PROXY_TOOL_VERIFIER=nexus` and
@@ -193,8 +193,13 @@ The verifier fails closed in the proxy's favor:
 ## Implementation notes
 
 The Temporal Rust SDK (1.0) can't host Nexus handlers yet; its `experimental` feature only adds
-calling Nexus operations from workflows. This crate therefore runs a Nexus-only worker directly on
-`temporalio-sdk-core`, which takes care of polling, worker heartbeats and shutdown. Temporal's
+calling Nexus operations from workflows. The Nexus worker therefore runs directly on
+`temporalio-sdk-core`, which takes care of polling, worker heartbeats and shutdown. It lives in
+[`../host`](../host) (`verifier-host`), shared with the [Dogwood verifier](../dogwood). Temporal's
 protos are compiled with the `vendored-protox` feature, so no system `protoc` is needed.
 
-Run the tests with `cargo test` (or `make test-cedar-verifier` from the repo root).
+`cedar-policy` is pinned to 4.11.0, the version Dogwood pins, so both verifiers share one Cargo
+workspace and lockfile (`verifiers/`).
+
+Run the tests with `cargo test -p cedar-verifier` in `verifiers/` (or `make test-cedar-verifier`
+from the repo root).

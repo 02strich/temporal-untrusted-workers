@@ -31,16 +31,23 @@ TAGS ?= latest
 PLATFORMS ?= linux/amd64,linux/arm64
 IMAGE_SOURCE := https://github.com/02strich/temporal-untrusted-workers
 
-.PHONY: generate test-cedar-verifier images image-proxy image-verify-worker image-verify-worker-ts ko-install check-ko check-docker check-repo
+.PHONY: generate test-verifiers test-cedar-verifier test-dogwood-verifier images image-proxy image-verify-worker image-verify-worker-ts ko-install check-ko check-docker check-repo
 
 # Regenerates gen/ from proto/ (the tool verifier Nexus contract).
 generate:
 	$(BUF) lint
 	$(BUF) generate
 
-# Tests the Rust/Cedar tool verifier (verifiers/cedar, a Cargo crate).
+# Tests the Rust tool verifiers (the verifiers/ Cargo workspace: the shared
+# Nexus host, and the Cedar and Dogwood verifiers).
+test-verifiers:
+	cd verifiers && cargo test
+
 test-cedar-verifier:
-	cd verifiers/cedar && cargo test
+	cd verifiers && cargo test -p verifier-host -p cedar-verifier
+
+test-dogwood-verifier:
+	cd verifiers && cargo test -p verifier-host -p dogwood-verifier
 
 images: image-proxy image-verify-worker image-verify-worker-ts
 

@@ -1,0 +1,18 @@
+# The temporal-proxy tool-call verifiers (TEMPORAL_PROXY_TOOL_VERIFIER=nexus).
+# Each verifier is a binary crate; `host` is the Nexus worker they share.
+[workspace]
+resolver = "3"
+members = ["host", "cedar", "dogwood"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.92"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+# preserve_order keeps logged JSON (e.g. the evaluated context) in field order.
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+verifier-host = { path = "host" }

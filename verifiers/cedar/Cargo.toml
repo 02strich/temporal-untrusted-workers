@@ -1,20 +1,17 @@
 [package]
 name = "cedar-verifier"
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.92"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 description = "temporal-proxy tool-call verifier Nexus service backed by Cedar policies"
-publish = false
 
 [dependencies]
-anyhow = "1"
-cedar-policy = "4.13"
-# preserve_order keeps logged JSON (e.g. the evaluated context) in field order.
-serde_json = { version = "1", features = ["preserve_order"] }
-temporalio-client = "~1.0.0"
-# vendored-protox compiles Temporal's protos without a system `protoc`.
-temporalio-common = { version = "~1.0.0", features = ["vendored-protox"] }
-temporalio-sdk-core = "~0.9.0"
-tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow.workspace = true
+# Pinned to the cedar-policy-core version dogwood-language pins (=4.11.0), so
+# both verifiers share one workspace and lockfile.
+cedar-policy = "=4.11.0"
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+verifier-host.workspace = true

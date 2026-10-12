@@ -32,4 +32,4 @@ go.work.sum
 # .vscode/
 
 # Rust build output
-verifiers/cedar/target/
+verifiers/**/target/
