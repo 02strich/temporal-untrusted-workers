@@ -18,7 +18,9 @@ use cedar_policy::{
     EntityUid, PolicySet, Request, RestrictedExpression, Schema, ValidationMode, Validator,
 };
 use serde_json::{Map, Value};
-use verifier_host::proto::{self, AnyData, Caller, Decision, Verdict, parse_any};
+use verifier_host::proto::{
+    self, AnyData, Caller, Decision, REASON_ANNOTATION, Verdict, parse_any, with_reasons,
+};
 
 /// One recorded input event: its name, how many events of that type and
 /// name the run received, and the latest one's payloads (protobuf JSON Anys).
@@ -153,14 +155,10 @@ impl PolicyEngine {
                     "deny"
                 };
                 // The policies that determined the decision, by @id.
-                let policies: Vec<&str> = response
-                    .diagnostics()
-                    .reason()
-                    .map(|id| {
-                        self.policies
-                            .annotation(id, "id")
-                            .unwrap_or_else(|| id.as_ref())
-                    })
+                let policies: Vec<&str> = self
+                    .deciding_policies(&response)
+                    .into_iter()
+                    .map(|(name, _)| name)
                     .collect();
                 let line = serde_json::json!({
                     "workflowId": workflow_id,
@@ -197,25 +195,50 @@ impl PolicyEngine {
         let escalate = determining
             .iter()
             .all(|id| self.policies.annotation(id, DECISION_ANNOTATION) == Some(ESCALATE));
-        let names: Vec<&str> = determining
-            .iter()
+        let deciding = self.deciding_policies(response);
+        let names: Vec<&str> = deciding.iter().map(|(name, _)| *name).collect();
+        let names = names.join(", ");
+        let (decision, message) = if escalate {
+            (
+                Decision::Escalate,
+                format!("tool {tool} escalated by Cedar policy {names}"),
+            )
+        } else {
+            (
+                Decision::Denied,
+                format!("tool {tool} denied by Cedar policy {names}"),
+            )
+        };
+        Verdict {
+            decision,
+            reason: with_reasons(
+                message,
+                deciding
+                    .iter()
+                    .filter_map(|(_, id)| self.policies.annotation(id, REASON_ANNOTATION)),
+            ),
+        }
+    }
+
+    /// The policies that determined a decision, by `@id` (or policy ID for a
+    /// policy without one), sorted by name so messages are stable.
+    fn deciding_policies<'a>(
+        &'a self,
+        response: &'a cedar_policy::Response,
+    ) -> Vec<(&'a str, &'a cedar_policy::PolicyId)> {
+        let mut policies: Vec<_> = response
+            .diagnostics()
+            .reason()
             .map(|id| {
-                self.policies
+                let name = self
+                    .policies
                     .annotation(id, "id")
-                    .unwrap_or_else(|| id.as_ref())
+                    .unwrap_or_else(|| id.as_ref());
+                (name, id)
             })
             .collect();
-        if escalate {
-            Verdict {
-                decision: Decision::Escalate,
-                reason: format!("tool {tool} escalated by Cedar policy {}", names.join(", ")),
-            }
-        } else {
-            Verdict {
-                decision: Decision::Denied,
-                reason: format!("tool {tool} denied by Cedar policy {}", names.join(", ")),
-            }
-        }
+        policies.sort_by_key(|(name, _)| *name);
+        policies
     }
 }
 
@@ -557,6 +580,35 @@ mod tests {
         assert_denied(
             call("payments/billing/Charge", vec![]),
             "charge-limit-10000",
+        );
+    }
+
+    #[test]
+    fn reasons_explain_denials_and_escalations() {
+        assert_escalated(
+            charge(json!(5000), "USD"),
+            "tool payments/billing/Charge escalated by Cedar policy charge-over-1000-needs-review: \
+             Charges above 1000 need a human's approval",
+        );
+        // Both forbids decide: their reasons are joined as sentences, in the
+        // (sorted) order the policies are named.
+        assert_eq!(
+            verify(charge(json!(50000), "USD")).reason,
+            "tool payments/billing/Charge denied by Cedar policy charge-limit-10000, charge-over-1000-needs-review: \
+             Charges above 10000, or without an amount, are never allowed. Charges above 1000 need a human's approval"
+        );
+
+        // A forbid without @reason is named by its @id only.
+        let policies = format!(
+            "{EXAMPLE_POLICY}\n@id(\"no-echo\")\nforbid (principal, action == Action::\"echo/echo/Echo\", resource);\n"
+        );
+        let engine = PolicyEngine::new(&policies, Some(SCHEMA)).unwrap();
+        let verdict = engine
+            .verify_no_inputs(&request(call("echo/echo/Echo", vec![])))
+            .unwrap();
+        assert_eq!(
+            verdict.reason,
+            "tool echo/echo/Echo denied by Cedar policy no-echo"
         );
     }
 

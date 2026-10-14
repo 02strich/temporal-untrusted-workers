@@ -44,6 +44,26 @@ impl Verdict {
     }
 }
 
+/// The policy annotation whose text explains a denial or escalation to the
+/// worker, e.g. `@reason("charges above 10000 are never allowed")`.
+pub const REASON_ANNOTATION: &str = "reason";
+
+/// Appends the deciding policies' `@reason`s to a verdict's message, joined
+/// as sentences: `"<message>: <reason>. <reason>"`. Trailing periods and
+/// blank reasons are dropped; without any reason the message is unchanged.
+pub fn with_reasons<'a>(message: String, reasons: impl IntoIterator<Item = &'a str>) -> String {
+    let reasons: Vec<&str> = reasons
+        .into_iter()
+        .map(|r| r.trim().trim_end_matches('.').trim_end())
+        .filter(|r| !r.is_empty())
+        .collect();
+    if reasons.is_empty() {
+        message
+    } else {
+        format!("{message}: {}", reasons.join(". "))
+    }
+}
+
 /// Well-known types whose protobuf JSON form is not a plain object of fields;
 /// inside an Any they appear under a "value" key.
 const VALUE_FORM_TYPES: &[&str] = &[
@@ -307,6 +327,20 @@ mod tests {
         assert_eq!(events.events[0].event_id, Some(5));
         assert_eq!(events.events[1].kind, "update");
         assert_eq!(events.events[1].update_id.as_deref(), Some("u-1"));
+    }
+
+    #[test]
+    fn joins_reasons_as_sentences() {
+        let msg = || "tool t denied by policy a, b".to_owned();
+        assert_eq!(with_reasons(msg(), []), "tool t denied by policy a, b");
+        assert_eq!(
+            with_reasons(msg(), ["Too large."]),
+            "tool t denied by policy a, b: Too large"
+        );
+        assert_eq!(
+            with_reasons(msg(), ["Too large. ", "  ", "Needs review"]),
+            "tool t denied by policy a, b: Too large. Needs review"
+        );
     }
 
     #[test]

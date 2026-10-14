@@ -24,9 +24,14 @@ use std::sync::Mutex;
 
 use anyhow::{Context as _, anyhow, bail};
 use dogwood_language::{Event, EventBuilder, Value as DwValue};
-use dogwood_local_engine::{DecisionResponse, DurableLog, DurableTemporalEngine, Outcome, Verb};
+use dogwood_local_engine::{
+    DecisionResponse, DurableLog, DurableTemporalEngine, Outcome, PolicyAttribution, Verb,
+};
 use serde_json::{Map, Value};
-use verifier_host::proto::{self, AnyData, Caller, Decision, InputEvents, Verdict, parse_any};
+use verifier_host::proto::{
+    self, AnyData, Caller, Decision, InputEvents, REASON_ANNOTATION, Verdict, parse_any,
+    with_reasons,
+};
 
 /// The namespace of the action schema's entities and actions.
 const NAMESPACE: &str = "Temporal";
@@ -317,31 +322,55 @@ fn deny_verdict(tool: &str, response: &DecisionResponse, default: DefaultDecisio
     let escalate = determining
         .iter()
         .all(|p| p.annotation(DECISION_ANNOTATION) == Some(ESCALATE));
-    let names = policy_names(response).join(", ");
-    if escalate {
-        Verdict {
-            decision: Decision::Escalate,
-            reason: format!("tool {tool} escalated by Dogwood policy {names}"),
-        }
+    let deciding = deciding_policies(response);
+    let names: Vec<&str> = deciding.iter().map(|(name, _)| name.as_str()).collect();
+    let names = names.join(", ");
+    let (decision, message) = if escalate {
+        (
+            Decision::Escalate,
+            format!("tool {tool} escalated by Dogwood policy {names}"),
+        )
     } else {
-        Verdict {
-            decision: Decision::Denied,
-            reason: format!("tool {tool} denied by Dogwood policy {names}"),
-        }
+        (
+            Decision::Denied,
+            format!("tool {tool} denied by Dogwood policy {names}"),
+        )
+    };
+    Verdict {
+        decision,
+        reason: with_reasons(
+            message,
+            deciding
+                .iter()
+                .filter_map(|(_, p)| p.annotation(REASON_ANNOTATION)),
+        ),
     }
 }
 
 /// The policies that determined a decision, by `@id` (or the store's token
 /// for a policy without one).
 fn policy_names(response: &DecisionResponse) -> Vec<String> {
-    response
+    deciding_policies(response)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// The policies that determined a decision with their names (see
+/// [`policy_names`]), sorted by name so messages are stable.
+fn deciding_policies(response: &DecisionResponse) -> Vec<(String, &PolicyAttribution)> {
+    let mut policies: Vec<_> = response
         .diagnostics()
         .reason()
         .map(|p| {
-            p.annotation_id()
-                .map_or_else(|| p.token.to_string(), str::to_owned)
+            let name = p
+                .annotation_id()
+                .map_or_else(|| p.token.to_string(), str::to_owned);
+            (name, p)
         })
-        .collect()
+        .collect();
+    policies.sort_by(|a, b| a.0.cmp(&b.0));
+    policies
 }
 
 /// `Temporal::Action::"<name>"`, for logging.
@@ -680,6 +709,37 @@ mod tests {
             json!([call("payments/billing/Charge", vec![])]),
             Decision::Denied,
             "denied by Dogwood policy",
+        );
+    }
+
+    #[test]
+    fn reasons_explain_denials_and_escalations() {
+        let store = TempStore::new();
+        let engine = store.open(EXAMPLE_POLICY);
+        assert_eq!(
+            verify(&engine, json!([charge(json!(5000), "USD")])).reason,
+            "tool payments/billing/Charge escalated by Dogwood policy charge-over-1000-needs-review: \
+             Charges above 1000 need a human's approval"
+        );
+        // Both forbids decide: their reasons are joined as sentences, in the
+        // (sorted) order the policies are named.
+        assert_eq!(
+            verify(&engine, json!([charge(json!(50000), "USD")])).reason,
+            "tool payments/billing/Charge denied by Dogwood policy charge-limit-10000, charge-over-1000-needs-review: \
+             Charges above 10000, or without an amount, are never allowed. Charges above 1000 need a human's approval"
+        );
+        drop(engine);
+
+        // A forbid without @reason is named by its @id only.
+        let store = TempStore::new();
+        let policies = format!(
+            "{EXAMPLE_POLICY}\n@id(\"no-echo\")\n\
+             forbid (principal, action == Temporal::Action::\"echo/echo/Echo\", resource);\n"
+        );
+        let engine = store.open(&policies);
+        assert_eq!(
+            verify(&engine, json!([call("echo/echo/Echo", vec![])])).reason,
+            "tool echo/echo/Echo denied by Dogwood policy no-echo"
         );
     }
 

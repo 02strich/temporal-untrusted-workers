@@ -80,6 +80,12 @@ exactly as in the Cedar verifier ([Escalating to a human](../cedar/README.md#esc
 if every policy that denied a call carries the annotation, the answer is `DECISION_ESCALATE`, and any
 call in the task that is denied outright wins.
 
+A `forbid` can explain itself to the worker with `@reason("…")`, as in the Cedar verifier
+([Telling the worker why](../cedar/README.md#telling-the-worker-why)). The text follows the deciding
+policies in the denial or escalation, e.g. `tool payments/billing/Charge escalated by Dogwood policy
+charge-over-1000-needs-review: Charges above 1000 need a human's approval`. Reasons of several deciding
+policies are joined as sentences, in the order the policies are named (sorted by `@id`).
+
 ### Calls no policy decides
 
 When no `permit` holds and no `forbid` applies, Dogwood denies by default. Such a call is answered
@@ -101,7 +107,8 @@ deny the call, in either mode. A policy that failed to evaluate might have been 
 [`policies/schema.cedarschema`](policies/schema.cedarschema), has the same rules as the Cedar
 verifier's example:
 - the Nexus operation `echo/echo/Echo` is allowed for everyone;
-- the Nexus operation `payments/billing/Charge` is allowed in USD or EUR:
+- the Nexus operation `payments/billing/Charge` is allowed in USD or EUR (both forbids carry a
+  `@reason`):
   - up to 1000 it goes through;
   - above 1000 it is escalated for review (`charge-over-1000-needs-review`);
   - above 10000, or without an amount, it is denied (`charge-limit-10000`);

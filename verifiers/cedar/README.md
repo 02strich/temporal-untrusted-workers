@@ -44,6 +44,24 @@ answers `DECISION_ESCALATE` rather than `DECISION_DENIED`, and the proxy rejects
 call in the same task that is denied outright. Approving escalated calls, for example by remembering
 an approval and answering `DECISION_APPROVED` when the worker retries, is up to you.
 
+### Telling the worker why
+
+A `forbid` can explain itself with a `@reason` annotation. The text is added to the denial or
+escalation reported to the worker, after the deciding policies. When several policies decide, their
+reasons are joined as sentences, in the order the policies are named (sorted by `@id`):
+
+```cedar
+@id("charge-limit-10000")
+@reason("Charges above 10000, or without an amount, are never allowed")
+forbid (principal, action == Action::"payments/billing/Charge", resource)
+unless { … };
+```
+
+This gives `tool payments/billing/Charge denied by Cedar policy charge-limit-10000: Charges above
+10000, or without an amount, are never allowed`. Policies without `@reason` are only named. The
+reason is fixed text, and it goes to the untrusted worker, so don't put anything in it the worker
+shouldn't see.
+
 ### Parameters
 
 The proxy sends each parameter as a `google.protobuf.Any` in protobuf JSON form. `argN.type` is its
@@ -111,7 +129,7 @@ verifier instance: with several, each sees only the events delivered to it.
 
 [`policies/example.cedar`](policies/example.cedar) allows:
 - the Nexus operation `echo/echo/Echo`, for everyone;
-- the Nexus operation `payments/billing/Charge`, in USD or EUR:
+- the Nexus operation `payments/billing/Charge`, in USD or EUR (both forbids carry a `@reason`):
   - up to 1000 it goes through;
   - above 1000 it is escalated for review (`charge-over-1000-needs-review`, a `forbid` annotated
     `@decision("escalate")`);

@@ -17,8 +17,10 @@ when {
 };
 
 // ...charges above 1000 need a human's approval (a forbid annotated
-// @decision("escalate") answers DECISION_ESCALATE instead of DECISION_DENIED)...
+// @decision("escalate") answers DECISION_ESCALATE instead of DECISION_DENIED;
+// @reason tells the worker why)...
 @id("charge-over-1000-needs-review")
+@reason("Charges above 1000 need a human's approval")
 @decision("escalate")
 forbid (principal, action == Temporal::Action::"payments/billing/Charge", resource)
 unless {
@@ -29,6 +31,7 @@ unless {
 
 // ...and charges above 10000, or without an amount, are never allowed.
 @id("charge-limit-10000")
+@reason("Charges above 10000, or without an amount, are never allowed")
 forbid (principal, action == Temporal::Action::"payments/billing/Charge", resource)
 unless {
   context.input has arg0 &&
