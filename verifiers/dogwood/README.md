@@ -80,7 +80,20 @@ exactly as in the Cedar verifier ([Escalating to a human](../cedar/README.md#esc
 if every policy that denied a call carries the annotation, the answer is `DECISION_ESCALATE`, and any
 call in the task that is denied outright wins.
 
-Evaluation errors, such as reading a field that's missing, are logged and deny the call.
+### Calls no policy decides
+
+When no `permit` holds and no `forbid` applies, Dogwood denies by default. Such a call is answered
+with `DECISION_DENIED`: `tool … not permitted by any Dogwood policy`. That covers a tool the schema
+doesn't declare, and a permit whose condition fails, such as an email to an address the run never
+received. With `DOGWOOD_DEFAULT_DECISION=escalate`, these calls go to human review instead
+(`DECISION_ESCALATE`, `tool … not decided by any Dogwood policy`), and the proxy rejects the task with
+a `pending human review: …` reason.
+
+In that mode, a call that must never happen needs an explicit `forbid`: a forbid still denies
+outright. A call denied outright in a task still outweighs any escalated call in it.
+
+Evaluation errors, such as reading a field that's missing or has the wrong type, are logged and always
+deny the call, in either mode. A policy that failed to evaluate might have been the one forbidding it.
 
 ## The example policy
 
@@ -163,6 +176,7 @@ Then point the proxy at it with `TEMPORAL_PROXY_TOOL_VERIFIER=nexus` and
 | `DOGWOOD_SCHEMA_FILE` | `policies/schema.cedarschema` | Action schema the policies are validated against. |
 | `DOGWOOD_EVENT_SCHEMA_FILE` | `policies/events.dwschema` | Event schema; fixed once the store exists. |
 | `DOGWOOD_STORE` | `dogwood.redb` | The durable store: the history and the installed policies. |
+| `DOGWOOD_DEFAULT_DECISION` | `deny` | What a tool call no policy decided gets: `deny` or `escalate` (see [Calls no policy decides](#calls-no-policy-decides)). Errors always deny. |
 | `RUST_LOG` | `info` | Log filter. |
 
 To see what a policy was evaluated against, run with `RUST_LOG=info,dogwood_request=debug`. The

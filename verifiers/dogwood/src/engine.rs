@@ -11,9 +11,15 @@
 //! denied a call is annotated `@decision("escalate")`, the call is escalated
 //! to human review instead (`DECISION_ESCALATE`). A denied call outweighs an
 //! escalated one.
+//!
+//! A call no policy decided (no `permit` held and no `forbid` applied,
+//! including a tool the schema doesn't declare) is denied, or escalated with
+//! [`DefaultDecision::Escalate`]. A call whose evaluation failed is always
+//! denied.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Mutex;
 
 use anyhow::{Context as _, anyhow, bail};
@@ -40,9 +46,32 @@ const ESCALATE: &str = "escalate";
 /// How many of a run's latest received events are kept for logging.
 const LOGGED_HISTORY: usize = 20;
 
+/// What a tool call no policy decided gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DefaultDecision {
+    /// `DECISION_DENIED`, Dogwood's (and Cedar's) default deny.
+    #[default]
+    Deny,
+    /// `DECISION_ESCALATE`: a human decides what no policy covers.
+    Escalate,
+}
+
+impl FromStr for DefaultDecision {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "deny" => Ok(DefaultDecision::Deny),
+            "escalate" => Ok(DefaultDecision::Escalate),
+            _ => bail!("unknown default decision {s:?} (expected \"deny\" or \"escalate\")"),
+        }
+    }
+}
+
 /// A Dogwood store with the policies installed.
 pub struct PolicyEngine {
     state: Mutex<State>,
+    default_decision: DefaultDecision,
 }
 
 struct State {
@@ -70,7 +99,14 @@ impl PolicyEngine {
                 store,
                 runs: Runs::new(max_runs),
             }),
+            default_decision: DefaultDecision::Deny,
         })
+    }
+
+    /// Sets what a tool call no policy decided gets (default: deny).
+    pub fn with_default_decision(mut self, default_decision: DefaultDecision) -> Self {
+        self.default_decision = default_decision;
+        self
     }
 
     /// Decides a `VerifyToolCallsRequest`, given in the protobuf JSON mapping.
@@ -127,7 +163,7 @@ impl PolicyEngine {
             if response.allowed() {
                 continue;
             }
-            let verdict = deny_verdict(&call.name, &response);
+            let verdict = deny_verdict(&call.name, &response, self.default_decision);
             if verdict.decision == Decision::Denied {
                 return Ok(verdict);
             }
@@ -256,12 +292,26 @@ fn received_action(kind: &str, name: &str) -> Option<String> {
     }
 }
 
-fn deny_verdict(tool: &str, response: &DecisionResponse) -> Verdict {
+fn deny_verdict(tool: &str, response: &DecisionResponse, default: DefaultDecision) -> Verdict {
     let determining: Vec<_> = response.diagnostics().reason().collect();
     if determining.is_empty() {
-        return Verdict {
-            decision: Decision::Denied,
-            reason: format!("tool {tool} not permitted by any Dogwood policy"),
+        // A policy that failed to evaluate may have been the one deciding:
+        // fail closed rather than treat the call as undecided.
+        if let Some(error) = response.diagnostics().errors().next() {
+            return Verdict {
+                decision: Decision::Denied,
+                reason: format!("tool {tool} denied: Dogwood policy evaluation failed: {error}"),
+            };
+        }
+        return match default {
+            DefaultDecision::Deny => Verdict {
+                decision: Decision::Denied,
+                reason: format!("tool {tool} not permitted by any Dogwood policy"),
+            },
+            DefaultDecision::Escalate => Verdict {
+                decision: Decision::Escalate,
+                reason: format!("tool {tool} not decided by any Dogwood policy"),
+            },
         };
     }
     let escalate = determining
@@ -511,6 +561,11 @@ mod tests {
         fn open(&self, policies: &str) -> PolicyEngine {
             PolicyEngine::open(&self.0, policies, SCHEMA, EVENT_SCHEMA, 100)
                 .expect("policies validate against the schemas")
+        }
+
+        fn open_escalating(&self, policies: &str) -> PolicyEngine {
+            self.open(policies)
+                .with_default_decision(DefaultDecision::Escalate)
         }
     }
 
@@ -817,6 +872,94 @@ mod tests {
         assert_ne!(without_echo, raised);
         let engine = store.open(&without_echo);
         assert!(!verify(&engine, json!([call("echo/echo/Echo", vec![])])).allowed());
+    }
+
+    #[test]
+    fn undecided_calls_escalate_when_configured() {
+        let store = TempStore::new();
+        let engine = store.open_escalating(EXAMPLE_POLICY);
+        // Permitted calls are still allowed, and forbids still decide.
+        assert!(verify(&engine, json!([charge(json!(500), "USD")])).allowed());
+        assert_decision(
+            &engine,
+            json!([charge(json!(5000), "USD")]),
+            Decision::Escalate,
+            "escalated by Dogwood policy charge-over-1000-needs-review",
+        );
+        assert_decision(
+            &engine,
+            json!([charge(json!(50000), "USD")]),
+            Decision::Denied,
+            "denied by Dogwood policy charge-limit-10000",
+        );
+        // No permit holds: a currency outside USD and EUR, an email to an
+        // address the run never received, an undeclared tool.
+        assert_decision(
+            &engine,
+            json!([charge(json!(500), "GBP")]),
+            Decision::Escalate,
+            "tool payments/billing/Charge not decided by any Dogwood policy",
+        );
+        let send = json!([call(
+            "trusted-tools/SendEmail",
+            vec![value_param(json!("mallory@evil.com"))]
+        )]);
+        assert_decision(
+            &engine,
+            send,
+            Decision::Escalate,
+            "not decided by any Dogwood policy",
+        );
+        assert_decision(
+            &engine,
+            json!([call("payments/billing/Refund", vec![])]),
+            Decision::Escalate,
+            "tool payments/billing/Refund not decided by any Dogwood policy",
+        );
+        // A call denied outright still outweighs an escalated one.
+        assert_decision(
+            &engine,
+            json!([
+                call("payments/billing/Refund", vec![]),
+                charge(json!(50000), "USD")
+            ]),
+            Decision::Denied,
+            "charge-limit-10000",
+        );
+    }
+
+    #[test]
+    fn evaluation_errors_deny_even_when_escalating() {
+        let store = TempStore::new();
+        // SendEmail's arg0 is declared a String; a record makes `like` fail.
+        let policies = format!(
+            "{EXAMPLE_POLICY}\n@id(\"email-example-com\")\n\
+             permit (principal, action == Temporal::Action::\"trusted-tools/SendEmail\", resource)\n\
+             when {{ context.input has arg0 && context.input.arg0 like \"*@example.com\" }};\n"
+        );
+        let engine = store.open_escalating(&policies);
+        let send = |arg: Value| json!([call("trusted-tools/SendEmail", vec![value_param(arg)])]);
+        assert!(verify(&engine, send(json!("bob@example.com"))).allowed());
+        assert_decision(
+            &engine,
+            send(json!({"to": "bob@example.com"})),
+            Decision::Denied,
+            "tool trusted-tools/SendEmail denied: Dogwood policy evaluation failed",
+        );
+    }
+
+    #[test]
+    fn default_decision_from_str() {
+        assert_eq!(
+            "deny".parse::<DefaultDecision>().unwrap(),
+            DefaultDecision::Deny
+        );
+        assert_eq!(
+            "escalate".parse::<DefaultDecision>().unwrap(),
+            DefaultDecision::Escalate
+        );
+        assert!("allow".parse::<DefaultDecision>().is_err());
+        assert_eq!(DefaultDecision::default(), DefaultDecision::Deny);
     }
 
     #[test]
