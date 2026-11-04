@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Starts the demo stack in the background:
-#   Temporal dev server -> trusted analytics tools -> Dogwood verifier ->
-#   temporal-proxy (TEMPORAL_PROXY_TOOL_VERIFIER=nexus) -> untrusted agent.
+#   Temporal dev server -> trusted analytics tools -> verifier (Dogwood, or
+#   plain Go with VERIFIER=go) -> temporal-proxy
+#   (TEMPORAL_PROXY_TOOL_VERIFIER=nexus) -> untrusted agent.
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 stack_init
@@ -9,10 +10,12 @@ stack_init
 # Build everything quietly first.
 build_harness
 build_proxy
-(cd "$REPO_DIR/verifiers" && cargo build -q --release -p dogwood-verifier && cp target/release/dogwood-verifier "$RUN_DIR/")
-cp "$DEMO_DIR/policies/analytics.dw" "$POLICY_FILE"
-# A fresh dev server means fresh workflow runs: start with an empty history.
-rm -f "$RUN_DIR/dogwood.redb"
+build_verifier
+if [ "$VERIFIER" = dogwood ]; then
+  cp "$DEMO_DIR/policies/analytics.dw" "$POLICY_FILE"
+  # A fresh dev server means fresh workflow runs: start with an empty history.
+  rm -f "$RUN_DIR/dogwood.redb"
+fi
 
 start_temporal
 step "Temporal dev server            $TEMPORAL_ADDRESS"
@@ -24,7 +27,11 @@ step "Nexus endpoint                 tool-verifier"
 step "Trusted analytics tools        RunQuery + PublishResults on task queue analytics"
 
 start_verifier
-step "Dogwood verifier               policy.dw (schema-validated), history in dogwood.redb"
+if [ "$VERIFIER" = dogwood ]; then
+  step "Dogwood verifier               policy.dw (schema-validated), history in dogwood.redb"
+else
+  step "Go verifier                    verifiers/analytics (rules in policy.go)"
+fi
 
 start_proxy \
   TEMPORAL_PROXY_TOOL_VERIFIER=nexus \

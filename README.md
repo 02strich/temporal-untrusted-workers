@@ -327,6 +327,11 @@ policies: Cedar plus temporal conditions over what each workflow run has receive
 refund what an `approval` signal named". It keeps that history in a durable store, so it survives
 verifier restarts. Both verifiers share the Nexus worker in [`verifiers/host`](verifiers/host).
 
+[`verifiers/analytics`](verifiers/analytics) is the policy of the
+[dogwood-analytics](demos/dogwood-analytics) demo written as plain Go instead of Dogwood policies: it
+parses each query's SQL, keeps queries read-only, and forbids publishing from a run that read the
+customers table. It shows what such a policy looks like as ordinary code.
+
 Run the verifier on trusted infrastructure, never behind the proxy itself: it decides what
 untrusted workers may do.
 

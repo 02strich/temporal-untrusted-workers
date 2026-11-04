@@ -233,6 +233,13 @@ func must(err error) {
 	}
 }
 
+func getEnv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
 func main() {
 	addr := os.Getenv("TEMPORAL_ADDRESS")
 	if len(os.Args) < 2 {
@@ -244,11 +251,13 @@ func main() {
 	case "untrusted":
 		untrusted(os.Getenv("PROXY_ADDRESS"))
 	case "run":
+		// env.sh sets the verifier's log target and engine name (Dogwood,
+		// or Go with VERIFIER=go).
 		logs := demokit.Logs{
 			Proxy:    os.Getenv("PROXY_LOG"),
 			Verifier: os.Getenv("VERIFIER_LOG"),
-			Target:   "dogwood_request",
-			Engine:   "Dogwood",
+			Target:   getEnv("VERIFIER_TARGET", "dogwood_request"),
+			Engine:   getEnv("VERIFIER_ENGINE", "Dogwood"),
 		}
 		run(addr, logs, os.Args[2:])
 	default:

@@ -31,7 +31,7 @@ TAGS ?= latest
 PLATFORMS ?= linux/amd64,linux/arm64
 IMAGE_SOURCE := https://github.com/02strich/temporal-untrusted-workers
 
-.PHONY: generate test-verifiers test-cedar-verifier test-dogwood-verifier images image-proxy image-verify-worker image-verify-worker-ts ko-install check-ko check-docker check-repo
+.PHONY: generate test-verifiers test-cedar-verifier test-dogwood-verifier test-analytics-verifier images image-proxy image-verify-worker image-verify-worker-ts ko-install check-ko check-docker check-repo
 
 # Regenerates gen/ from proto/ (the tool verifier Nexus contract).
 generate:
@@ -48,6 +48,10 @@ test-cedar-verifier:
 
 test-dogwood-verifier:
 	cd verifiers && cargo test -p verifier-host -p dogwood-verifier
+
+# Tests the plain-Go verifier of the dogwood-analytics demo (its own Go module).
+test-analytics-verifier:
+	cd verifiers/analytics && go test ./...
 
 images: image-proxy image-verify-worker image-verify-worker-ts
 

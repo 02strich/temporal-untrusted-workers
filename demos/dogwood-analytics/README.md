@@ -46,6 +46,22 @@ Each case shows the requests Dogwood evaluated: the context (including `sql`), t
 (its input, the `read_table` events, and the query results), and the policy that decided it.
 Histories are per workflow run: one run reading customers doesn't affect another.
 
+## The same policy in plain Go
+
+[`verifiers/analytics`](../../verifiers/analytics) enforces the same rules as ordinary Go code: a SQL
+parser, a few `if` statements and a per-run map instead of a policy language. Run the demo against it
+with `VERIFIER=go`:
+
+```bash
+VERIFIER=go ./up.sh
+export VERIFIER=go; source env.sh
+demo run weekly-kpis top-accounts injected fix-the-numbers drop-table publish-only
+```
+
+Every case ends the same way, decided by the rule of the same name, and each evaluation shows the
+tables the Go verifier remembered for the run. Unlike Dogwood, it keeps them in memory only: after a
+restart a run's `PublishResults` is denied until it queries `metrics` again.
+
 ## Running it yourself
 
 Requirements: Go, Rust and the Temporal CLI.
