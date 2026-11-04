@@ -1,0 +1,29 @@
+// Policies for the Insights analytics agent. It may look at product metrics
+// and customer records to answer questions, but only results computed from
+// the metrics table may be published company-wide. Dogwood denies anything
+// no policy permits.
+
+// The agent may read metrics and customers, but never change data.
+@id("queries-are-read-only")
+permit (principal, action == Temporal::Action::"analytics/RunQuery", resource)
+when {
+  context has sql &&
+  context.sql.writes.isEmpty() &&
+  ["metrics", "customers"].containsAll(context.sql.reads)
+};
+
+// Results may be published once the run has queried the metrics table...
+@id("publish-metrics")
+permit (principal, action == Temporal::Action::"analytics/PublishResults", resource)
+when temporal {
+  formerly within 30d Temporal::Action::"analytics/RunQuery"::read_table{ table: "metrics" }
+};
+
+// ...but not once the run has read the customers table: customer data may be
+// in its results, whatever the report looks like.
+@id("no-customer-data-in-published-results")
+@reason("This run read the customers table, so its results may contain customer data and can't be published")
+forbid (principal, action == Temporal::Action::"analytics/PublishResults", resource)
+when temporal {
+  formerly within 30d Temporal::Action::"analytics/RunQuery"::read_table{ table: "customers" }
+};

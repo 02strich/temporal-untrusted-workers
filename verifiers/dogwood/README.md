@@ -186,7 +186,28 @@ Anything the verifier doesn't understand fails closed: if any of the call's quer
 a string, doesn't parse, or is anything but `SELECT`, `INSERT`, `UPDATE` or `DELETE` (DDL, `TRUNCATE`,
 `MERGE`, `SELECT … INTO`, …), the call has no `context.sql`, so a `permit` requiring it doesn't hold
 and a `forbid … unless { context has sql && … }` applies. Only tables are analyzed, not what the
-functions a query calls do. Only `request` events get `context.sql`; temporal patterns can't match it.
+functions a query calls do. Only `request` events get `context.sql`; temporal patterns match the tables recorded as history instead (see [Tables as history](#tables-as-history)).
+
+### Tables as history
+
+A query's tables also become history of the run. Unless the call is denied (an allowed or escalated
+call may run), the verifier records a `read_table` event of the tool's action for every table it
+reads, and a `wrote_table` event for every table it writes, each with a `table` field. A later call,
+even of another tool, can look back on them, e.g. to forbid publishing once the run read customer
+data:
+
+```cedar
+forbid (principal, action == Temporal::Action::"analytics/PublishResults", resource)
+when temporal {
+  formerly within 30d Temporal::Action::"analytics/RunQuery"::read_table{ table: "customers" }
+};
+```
+
+The two event kinds are declared in [`policies/events.dwschema`](policies/events.dwschema). A store
+created with an older event schema can't be opened with this one; start with a new store. The
+[dogwood-analytics](../../demos/dogwood-analytics) demo is built on this.
+
+### Example policies
 
 Read-only access to some tables, and writes to one of them:
 

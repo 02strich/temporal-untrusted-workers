@@ -8,6 +8,7 @@ with [VHS](https://github.com/charmbracelet/vhs).
 |------|-------|
 | [cedar-tool-calls](cedar-tool-calls) | Untrusted workflows calling trusted tools (Nexus operations, activities on other task queues), allowed or blocked by Cedar policies; the proxy's own same-queue rule; a live policy edit. |
 | [dogwood-tool-calls](dogwood-tool-calls) | The same cases, decided by Dogwood policies that look back on what each workflow run received (its input, an approval signal), kept in a durable history. |
+| [dogwood-analytics](dogwood-analytics) | An analytics agent's SQL tool calls: Dogwood parses each query, keeps it read-only, and forbids publishing results once the run has read the customers table. |
 
 ## Running a demo
 
@@ -44,7 +45,7 @@ demos/
 ## Adding a demo
 
 1. Create `demos/<name>/` with an `env.sh` that sets `DEMO_DIR`, picks an unused `DEMO_PORT_BASE`
-   (taken so far: 47000, 51000), and sources `../lib/stack.sh`.
+   (taken so far: 47000, 51000, 55000), and sources `../lib/stack.sh`.
 2. Write `up.sh` from the `lib/stack.sh` building blocks: `stack_init`, `build_harness`,
    `build_proxy`, `start_temporal`, `create_endpoint`, `start_proxy`, `bg`, and `step` for progress
    output. `down.sh` is just `stack_down`.

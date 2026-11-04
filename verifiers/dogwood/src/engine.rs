@@ -19,13 +19,17 @@
 //!
 //! A tool call of an action the schema annotates `@sql("<path>")` also gets
 //! `context.sql`, the tables its SQL reads and writes (see [`crate::sql`]).
+//! Unless the call is denied, every table it reads is then recorded as a
+//! `read_table` history event of its action, and every table it writes as a
+//! `wrote_table` event, so later decisions can look back on what the run
+//! queried (e.g. no publishing once it read customer data).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
 
-use crate::sql::SqlFields;
+use crate::sql::{SqlAccess, SqlFields};
 use anyhow::{Context as _, anyhow, bail};
 use dogwood_language::{Event, EventBuilder, Value as DwValue};
 use dogwood_local_engine::{
@@ -45,6 +49,9 @@ const NAMESPACE: &str = "Temporal";
 const REQUEST: &str = "request";
 /// The event kind of what a run received: history.
 const RECEIVED: &str = "received";
+/// The event kinds of a table a call's SQL read / wrote: history.
+const READ_TABLE: &str = "read_table";
+const WROTE_TABLE: &str = "wrote_table";
 
 /// Events between snapshots of the store's monitor state.
 const SNAPSHOT_INTERVAL: u64 = 1000;
@@ -134,8 +141,8 @@ impl PolicyEngine {
             .map(|(i, call)| {
                 let mut input = EventInput::new(&caller, &call.parameters)
                     .with_context(|| format!("tool call {i}"))?;
-                self.add_sql(&call.name, &mut input);
-                Ok(input)
+                let sql = self.add_sql(&call.name, &mut input);
+                Ok((input, sql))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -143,7 +150,8 @@ impl PolicyEngine {
         let resource = entity("TaskQueue", &caller.task_queue);
         let mut state = self.state.lock().expect("dogwood state lock");
         let mut escalation = None;
-        for (call, input) in tool_calls.iter().zip(calls) {
+        let run = caller.run_key();
+        for (call, (input, sql)) in tool_calls.iter().zip(calls) {
             let event = input
                 .builder(&call.name, REQUEST)
                 .principal(&principal)
@@ -176,15 +184,20 @@ impl PolicyEngine {
                 });
                 tracing::debug!(target: "dogwood_request", "{line}");
             }
-            if response.allowed() {
-                continue;
+            let verdict = (!response.allowed())
+                .then(|| deny_verdict(&call.name, &response, self.default_decision));
+            if verdict.as_ref().map(|v| v.decision) == Some(Decision::Denied) {
+                return Ok(verdict.expect("denied"));
             }
-            let verdict = deny_verdict(&call.name, &response, self.default_decision);
-            if verdict.decision == Decision::Denied {
-                return Ok(verdict);
+            // The call may run (allowed, or escalated to a human who may
+            // allow it): record the tables its SQL touches.
+            if let Some(sql) = &sql {
+                record_tables(&mut state, &run, &call.name, &input, sql)?;
             }
-            // Keep checking: a later denied call outweighs this escalation.
-            escalation.get_or_insert(verdict);
+            if let Some(verdict) = verdict {
+                // Keep checking: a later denied call outweighs this escalation.
+                escalation.get_or_insert(verdict);
+            }
         }
         Ok(escalation.unwrap_or_else(Verdict::approve))
     }
@@ -192,12 +205,15 @@ impl PolicyEngine {
     /// Adds `context.sql` to a call of an action with SQL parameters. SQL
     /// that can't be analyzed adds nothing, so policies requiring it fail
     /// closed.
-    fn add_sql(&self, tool: &str, input: &mut EventInput) {
-        match self.sql_fields.access(tool, &input.json["input"]) {
-            None => {}
-            Some(Ok(access)) => input.add_request_context("sql", access.to_json()),
-            Some(Err(error)) => {
+    fn add_sql(&self, tool: &str, input: &mut EventInput) -> Option<SqlAccess> {
+        match self.sql_fields.access(tool, &input.json["input"])? {
+            Ok(access) => {
+                input.add_request_context("sql", access.to_json());
+                Some(access)
+            }
+            Err(error) => {
                 tracing::debug!(%tool, error = format!("{error:#}"), "no context.sql: SQL not analyzed");
+                None
             }
         }
     }
@@ -304,6 +320,45 @@ fn sync_policies(
             .batch(verbs)
             .map_err(|e| anyhow!("updating Dogwood policies: {e}"))?;
         tracing::info!(added = new, deleted, "Dogwood policies updated");
+    }
+    Ok(())
+}
+
+/// Records a `read_table` event for every table `sql` reads and a
+/// `wrote_table` event for every table it writes, as history of `tool`'s
+/// action in `run`. A table already recorded for the run (while it is among
+/// the recent runs) isn't recorded again.
+fn record_tables(
+    state: &mut State,
+    run: &str,
+    tool: &str,
+    input: &EventInput,
+    sql: &SqlAccess,
+) -> anyhow::Result<()> {
+    let tables = sql
+        .reads
+        .iter()
+        .map(|t| (READ_TABLE, t))
+        .chain(sql.writes.iter().map(|t| (WROTE_TABLE, t)));
+    for (kind, table) in tables {
+        let id = EventKey::Table(kind, tool.to_owned(), table.clone());
+        if state.runs.seen(run, &id) {
+            continue;
+        }
+        state
+            .store
+            .submit(input.table_event(tool, kind, table))
+            .map_err(|e| anyhow!("recording {kind} {table} of {tool}: {e}"))?;
+        let field = if kind == READ_TABLE {
+            "readTable"
+        } else {
+            "wroteTable"
+        };
+        state.runs.add_entry(
+            run,
+            id,
+            serde_json::json!({"action": action(tool), field: table}),
+        );
     }
     Ok(())
 }
@@ -475,6 +530,20 @@ impl EventInput {
         }
         event
     }
+
+    /// A `read_table` / `wrote_table` event of the action `name` for `table`,
+    /// with this context's caller (which the event schema pins it by).
+    fn table_event(&self, name: &str, kind: &str, table: &str) -> EventBuilder {
+        let mut event = Event::builder(&format!("{NAMESPACE}::Action::{name}"), kind)
+            .logged_field("table", DwValue::String(table.to_owned()));
+        for (group, name, value) in self.fields.iter().filter(|(g, ..)| *g == "caller") {
+            event =
+                event
+                    .field(group, name, value.clone())
+                    .request_context(group, name, value.clone());
+        }
+        event
+    }
 }
 
 /// A parameter (a protobuf JSON Any) as policies see it: a plain JSON value
@@ -532,6 +601,8 @@ fn to_dogwood(value: &Value) -> DwValue {
 enum EventKey {
     Update(String),
     Event(i64),
+    /// A table a tool's SQL touched: (kind, tool, table).
+    Table(&'static str, String, String),
     /// No ID: never deduplicated.
     None,
 }
@@ -576,6 +647,15 @@ impl Runs {
     }
 
     fn add(&mut self, run: &str, id: EventKey, action: &str, context: &Value) {
+        self.add_entry(
+            run,
+            id,
+            serde_json::json!({"action": self::action(action), "input": context["input"]}),
+        );
+    }
+
+    /// Records an event of the run under `id`, logged as `entry`.
+    fn add_entry(&mut self, run: &str, id: EventKey, entry: Value) {
         if !self.runs.contains_key(run) {
             while self.runs.len() >= self.max_runs {
                 let Some(oldest) = self.order.pop_front() else {
@@ -592,9 +672,7 @@ impl Runs {
         if log.history.len() == LOGGED_HISTORY {
             log.history.pop_front();
         }
-        log.history.push_back(
-            serde_json::json!({"action": self::action(action), "input": context["input"]}),
-        );
+        log.history.push_back(entry);
     }
 
     /// The run's latest received events, oldest first.
@@ -1115,6 +1193,158 @@ mod tests {
             )
             .allowed()
         );
+    }
+
+    #[test]
+    fn sql_tables_become_history() {
+        let store = TempStore::new();
+        let policies = format!(
+            "{EXAMPLE_POLICY}\n@id(\"no-email-after-customer-data\")\n\
+             forbid (principal, action == Temporal::Action::\"trusted-tools/SendEmail\", resource)\n\
+             when temporal {{ formerly within 30d \
+             Temporal::Action::\"trusted-tools/RunQuery\"::read_table{{ table: \"customers\" }} }};\n"
+        );
+        let engine = store.open(&policies);
+        record(
+            &engine,
+            "r1",
+            json!([workflow_input(
+                1,
+                json!({"customerEmail": "alice@example.com"})
+            )]),
+        );
+        let send = json!([call(
+            "trusted-tools/SendEmail",
+            vec![value_param(json!("alice@example.com"))]
+        )]);
+        assert!(verify(&engine, send.clone()).allowed());
+
+        // Reading orders only leaves the email allowed.
+        assert!(verify(&engine, run_query(json!("SELECT * FROM orders"))).allowed());
+        assert!(verify(&engine, send.clone()).allowed());
+        // A denied query records nothing.
+        assert!(!verify(&engine, run_query(json!("DROP TABLE customers"))).allowed());
+        assert!(!verify(&engine, run_query(json!("DELETE FROM customers"))).allowed());
+        assert!(verify(&engine, send.clone()).allowed());
+
+        // Once the run read customers, the email is forbidden.
+        assert!(
+            verify(
+                &engine,
+                run_query(json!(
+                    "SELECT o.id FROM orders o JOIN customers c ON c.id = o.cid"
+                ))
+            )
+            .allowed()
+        );
+        assert_decision(
+            &engine,
+            send.clone(),
+            Decision::Denied,
+            "denied by Dogwood policy no-email-after-customer-data",
+        );
+        {
+            let state = engine.state.lock().unwrap();
+            let history = state.runs.history("ns-a/billing-42/r1");
+            assert!(history.contains(&json!({
+                "action": "Temporal::Action::\"trusted-tools/RunQuery\"",
+                "readTable": "customers",
+            })));
+        }
+
+        // Another run's history doesn't have it.
+        record(
+            &engine,
+            "r2",
+            json!([workflow_input(
+                1,
+                json!({"customerEmail": "alice@example.com"})
+            )]),
+        );
+        assert!(engine.verify(&request("r2", send)).unwrap().allowed());
+    }
+
+    /// The dogwood-analytics demo's policies, end to end.
+    #[test]
+    fn analytics_demo_policies() {
+        const POLICY: &str = include_str!("../../../demos/dogwood-analytics/policies/analytics.dw");
+        const DEMO_SCHEMA: &str =
+            include_str!("../../../demos/dogwood-analytics/policies/schema.cedarschema");
+        let store = TempStore::new();
+        let engine = PolicyEngine::open(&store.0, POLICY, DEMO_SCHEMA, EVENT_SCHEMA, 100).unwrap();
+        let query = |q: &str| {
+            json!([call(
+                "analytics/RunQuery",
+                vec![value_param(json!({"query": q}))]
+            )])
+        };
+        let publish = |run: &str| {
+            engine
+                .verify(&request(
+                    run,
+                    json!([call(
+                        "analytics/PublishResults",
+                        vec![value_param(
+                            json!({"channel": "#kpi-weekly", "title": "KPIs", "body": "up"})
+                        )]
+                    )]),
+                ))
+                .unwrap()
+        };
+        let metrics = "SELECT week, signups FROM metrics";
+
+        // Nothing queried: nothing to publish.
+        assert!(!publish("r1").allowed());
+        assert!(
+            engine
+                .verify(&request("r1", query(metrics)))
+                .unwrap()
+                .allowed()
+        );
+        assert!(publish("r1").allowed());
+
+        // A query joining customers taints the run.
+        let joined = "SELECT c.company FROM metrics m JOIN customers c ON c.id = m.customer_id";
+        assert!(
+            engine
+                .verify(&request("r2", query(joined)))
+                .unwrap()
+                .allowed()
+        );
+        let verdict = publish("r2");
+        assert_eq!(verdict.decision, Decision::Denied, "{verdict:?}");
+        assert!(
+            verdict
+                .reason
+                .contains("no-customer-data-in-published-results")
+        );
+
+        // ...even if a clean query follows.
+        assert!(
+            engine
+                .verify(&request("r3", query("SELECT email FROM customers")))
+                .unwrap()
+                .allowed()
+        );
+        assert!(
+            engine
+                .verify(&request("r3", query(metrics)))
+                .unwrap()
+                .allowed()
+        );
+        assert!(!publish("r3").allowed());
+
+        // Writes, other tables and DDL are denied.
+        for q in [
+            "UPDATE metrics SET churn_pct = 2.1",
+            "DROP TABLE customers",
+            "SELECT * FROM invoices",
+        ] {
+            assert!(
+                !engine.verify(&request("r4", query(q))).unwrap().allowed(),
+                "{q}"
+            );
+        }
     }
 
     #[test]

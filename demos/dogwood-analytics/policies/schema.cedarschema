@@ -1,0 +1,64 @@
+// Dogwood action schema for the dogwood-analytics demo: an untrusted
+// analytics agent answering product questions with two trusted tools on the
+// `analytics` task queue.
+//
+//   principal: Temporal::Worker::"<subject>", the worker identity
+//   action:    Temporal::Action::"analytics/RunQuery" etc. (a tool call), or
+//              Temporal::Action::"workflow/InsightsWorkflow" (the run's input)
+//   resource:  Temporal::TaskQueue::"<queue>", the calling workflow's task queue
+//
+// Every event's context is { input, caller }; RunQuery's request also has
+// `sql`, the tables its query reads and writes. Each table RunQuery reads is
+// recorded as a `read_table` history event (see the verifier's
+// events.dwschema), which PublishResults' policies look back on.
+namespace Temporal {
+  entity Worker;
+  entity TaskQueue;
+
+  type Caller = {
+    namespace: String,
+    workflowId: String,
+    run: String,
+    taskQueue: String,
+  };
+
+  // The tables a query reads and writes, from the verifier's SQL analysis.
+  // Missing if the query isn't a SELECT, INSERT, UPDATE or DELETE it could
+  // analyze.
+  type SqlAccess = { reads: Set<String>, writes: Set<String> };
+
+  // RunQuery({query: "SELECT ..."}) runs SQL against the analytics warehouse.
+  @sql("arg0.query")
+  action "analytics/RunQuery" appliesTo {
+    principal: [Worker], resource: [TaskQueue],
+    context: {
+      input: { parameterCount: Long, arg0?: { query?: String } },
+      caller: Caller,
+      sql?: SqlAccess,
+    },
+  };
+
+  // PublishResults({channel, title, body}) posts a report to a company channel.
+  action "analytics/PublishResults" appliesTo {
+    principal: [Worker], resource: [TaskQueue],
+    context: {
+      input: {
+        parameterCount: Long,
+        arg0?: { channel?: String, title?: String, body?: String },
+      },
+      caller: Caller,
+    },
+  };
+
+  // The agent's workflow input: the question it was asked.
+  action "workflow/InsightsWorkflow" appliesTo {
+    principal: [Worker], resource: [TaskQueue],
+    context: {
+      input: {
+        parameterCount: Long,
+        arg0?: { case?: String, question?: String, askedBy?: String },
+      },
+      caller: Caller,
+    },
+  };
+}
