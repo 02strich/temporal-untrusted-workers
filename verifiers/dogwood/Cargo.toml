@@ -8,9 +8,12 @@ description = "temporal-proxy tool-call verifier Nexus service backed by Dogwood
 
 [dependencies]
 anyhow.workspace = true
+# Reads the action schema's @sql annotations.
+cedar-policy.workspace = true
 dogwood-language = "1.0"
 dogwood-local-engine = "1.0"
 serde_json.workspace = true
+sqlparser = { version = "0.63", features = ["visitor"] }
 tokio.workspace = true
 tracing.workspace = true
 verifier-host.workspace = true

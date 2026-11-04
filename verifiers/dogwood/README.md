@@ -127,6 +127,9 @@ verifier's example:
 - the activity `trusted-tools/IssueRefund` is only allowed for a refund that an `approval` signal named
   (`refund-needs-approval`, the same pattern on `Temporal::Action::"signal/approval"`). Signals are
   sent from outside the workflow, so this is a human's approval, not something the workflow decided.
+- the activity `trusted-tools/RunQuery` may read the `customers` and `orders` tables
+  (`run-query-read-customers-orders`) and write `orders` (`run-query-write-orders`); see
+  [SQL parameters](#sql-parameters).
 
 ## Declaring a tool or an input
 
@@ -145,6 +148,63 @@ action "payments/billing/Refund" appliesTo {
 ```
 
 Events of undeclared actions are still recorded, but no policy can refer to them.
+
+## SQL parameters
+
+A tool that takes SQL, such as a database activity, can be limited to the tables it reads and
+writes. Annotate its action with `@sql` naming where the SQL is, as paths under `context.input`, and
+declare an optional `sql` context attribute:
+
+```cedar
+@sql("arg0.query")
+action "trusted-tools/RunQuery" appliesTo {
+  principal: [Worker], resource: [TaskQueue],
+  context: {
+    input: { parameterCount: Long, arg0?: { query?: String } },
+    caller: Caller,
+    sql?: SqlAccess,   // { reads: Set<String>, writes: Set<String> }
+  },
+};
+```
+
+The verifier parses the SQL of each call and sets `context.sql.reads` and `context.sql.writes`:
+- `SELECT` reads every table it names, in joins and subqueries too; names of common table
+  expressions aren't tables.
+- `INSERT`, `UPDATE` and `DELETE` write their target (every table of a multi-table `UPDATE` or
+  `DELETE`), and read the other tables they name (`INSERT … SELECT`, `UPDATE … FROM`,
+  `DELETE … USING`, subqueries). A target is only also read if the statement names it again.
+  A data-modifying `WITH` clause writes, too.
+- Tables are named as written, joined with `.`: unquoted identifiers lowercased, quoted ones verbatim.
+  `Orders` is `orders`, `"Orders"` is `Orders`, and `public.orders` is not `orders`, so list both
+  if queries use both.
+
+A call can carry several queries: a path may name a list of strings (`@sql("arg0.queries")`), the
+annotation may list several paths (`@sql("arg0.query, arg1.query")`), and a string may hold several
+statements. They are all combined into one `context.sql`.
+
+Anything the verifier doesn't understand fails closed: if any of the call's queries is missing, isn't
+a string, doesn't parse, or is anything but `SELECT`, `INSERT`, `UPDATE` or `DELETE` (DDL, `TRUNCATE`,
+`MERGE`, `SELECT … INTO`, …), the call has no `context.sql`, so a `permit` requiring it doesn't hold
+and a `forbid … unless { context has sql && … }` applies. Only tables are analyzed, not what the
+functions a query calls do. Only `request` events get `context.sql`; temporal patterns can't match it.
+
+Read-only access to some tables, and writes to one of them:
+
+```cedar
+permit (principal, action == Temporal::Action::"trusted-tools/RunQuery", resource)
+when {
+  context has sql &&
+  context.sql.writes.isEmpty() &&
+  ["customers", "orders"].containsAll(context.sql.reads)
+};
+
+permit (principal, action == Temporal::Action::"trusted-tools/RunQuery", resource)
+when {
+  context has sql &&
+  ["orders"].containsAll(context.sql.writes) &&
+  ["customers", "orders"].containsAll(context.sql.reads)
+};
+```
 
 ## Policy changes keep the history
 

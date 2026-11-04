@@ -11,6 +11,9 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1"
+# Pinned to the cedar-policy-core version dogwood-language pins (=4.11.0), so
+# both verifiers share one workspace and lockfile.
+cedar-policy = "=4.11.0"
 # preserve_order keeps logged JSON (e.g. the evaluated context) in field order.
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal"] }

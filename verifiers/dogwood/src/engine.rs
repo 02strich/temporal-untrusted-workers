@@ -16,18 +16,23 @@
 //! including a tool the schema doesn't declare) is denied, or escalated with
 //! [`DefaultDecision::Escalate`]. A call whose evaluation failed is always
 //! denied.
+//!
+//! A tool call of an action the schema annotates `@sql("<path>")` also gets
+//! `context.sql`, the tables its SQL reads and writes (see [`crate::sql`]).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
 
+use crate::sql::SqlFields;
 use anyhow::{Context as _, anyhow, bail};
 use dogwood_language::{Event, EventBuilder, Value as DwValue};
 use dogwood_local_engine::{
     DecisionResponse, DurableLog, DurableTemporalEngine, Outcome, PolicyAttribution, Verb,
 };
 use serde_json::{Map, Value};
+
 use verifier_host::proto::{
     self, AnyData, Caller, Decision, InputEvents, REASON_ANNOTATION, Verdict, parse_any,
     with_reasons,
@@ -77,6 +82,7 @@ impl FromStr for DefaultDecision {
 pub struct PolicyEngine {
     state: Mutex<State>,
     default_decision: DefaultDecision,
+    sql_fields: SqlFields,
 }
 
 struct State {
@@ -96,6 +102,7 @@ impl PolicyEngine {
         event_schema: &str,
         max_runs: usize,
     ) -> anyhow::Result<Self> {
+        let sql_fields = SqlFields::from_schema(schema, NAMESPACE)?;
         let mut store = DurableTemporalEngine::open(path, SNAPSHOT_INTERVAL)
             .map_err(|e| anyhow!("opening Dogwood store {}: {e}", path.display()))?;
         sync_policies(&mut store, policies, schema, event_schema)?;
@@ -105,6 +112,7 @@ impl PolicyEngine {
                 runs: Runs::new(max_runs),
             }),
             default_decision: DefaultDecision::Deny,
+            sql_fields,
         })
     }
 
@@ -124,7 +132,10 @@ impl PolicyEngine {
             .iter()
             .enumerate()
             .map(|(i, call)| {
-                EventInput::new(&caller, &call.parameters).with_context(|| format!("tool call {i}"))
+                let mut input = EventInput::new(&caller, &call.parameters)
+                    .with_context(|| format!("tool call {i}"))?;
+                self.add_sql(&call.name, &mut input);
+                Ok(input)
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -176,6 +187,19 @@ impl PolicyEngine {
             escalation.get_or_insert(verdict);
         }
         Ok(escalation.unwrap_or_else(Verdict::approve))
+    }
+
+    /// Adds `context.sql` to a call of an action with SQL parameters. SQL
+    /// that can't be analyzed adds nothing, so policies requiring it fail
+    /// closed.
+    fn add_sql(&self, tool: &str, input: &mut EventInput) {
+        match self.sql_fields.access(tool, &input.json["input"]) {
+            None => {}
+            Some(Ok(access)) => input.add_request_context("sql", access.to_json()),
+            Some(Err(error)) => {
+                tracing::debug!(%tool, error = format!("{error:#}"), "no context.sql: SQL not analyzed");
+            }
+        }
     }
 
     /// Records a `RecordInputEventsRequest`'s events as the run's history.
@@ -387,6 +411,9 @@ fn entity(entity_type: &str, id: &str) -> String {
 /// logging what Dogwood evaluated).
 struct EventInput {
     fields: Vec<(&'static str, String, DwValue)>,
+    /// Request context only (not event fields): what conditions read but
+    /// temporal patterns don't match, e.g. `sql`.
+    request_only: Vec<(&'static str, String, DwValue)>,
     json: Value,
 }
 
@@ -416,7 +443,20 @@ impl EventInput {
                 fields.push((group, name.clone(), to_dogwood(value)));
             }
         }
-        Ok(Self { fields, json })
+        Ok(Self {
+            fields,
+            request_only: Vec::new(),
+            json,
+        })
+    }
+
+    /// Adds `context.<group>`, a record, to the request context only.
+    fn add_request_context(&mut self, group: &'static str, record: Value) {
+        for (name, value) in record.as_object().into_iter().flatten() {
+            self.request_only
+                .push((group, name.clone(), to_dogwood(value)));
+        }
+        self.json[group] = record;
     }
 
     /// An event of `kind` for the action `name` with this context: both as
@@ -429,6 +469,9 @@ impl EventInput {
                 event
                     .field(group, name, value.clone())
                     .request_context(group, name, value.clone());
+        }
+        for (group, name, value) in &self.request_only {
+            event = event.request_context(group, name, value.clone());
         }
         event
     }
@@ -1006,6 +1049,95 @@ mod tests {
             Decision::Denied,
             "tool trusted-tools/SendEmail denied: Dogwood policy evaluation failed",
         );
+    }
+
+    fn run_query(query: Value) -> Value {
+        json!([call(
+            "trusted-tools/RunQuery",
+            vec![value_param(json!({"query": query}))]
+        )])
+    }
+
+    #[test]
+    fn sql_table_access() {
+        let store = TempStore::new();
+        let engine = store.open(EXAMPLE_POLICY);
+        let allowed = |query: &str| verify(&engine, run_query(json!(query))).allowed();
+
+        // Reading customers and orders.
+        assert!(allowed(
+            "SELECT c.name, o.total FROM customers c JOIN orders o ON o.customer_id = c.id"
+        ));
+        assert!(allowed(
+            "SELECT * FROM Orders WHERE id IN (SELECT order_id FROM orders)"
+        ));
+        // Writing orders.
+        assert!(allowed("UPDATE orders SET status = 'paid' WHERE id = 7"));
+        assert!(allowed(
+            "INSERT INTO orders SELECT * FROM orders WHERE id = 1; SELECT * FROM customers"
+        ));
+        // Other tables, or writing customers.
+        assert!(!allowed("SELECT * FROM secrets"));
+        assert!(!allowed("SELECT * FROM orders, public.customers"));
+        assert!(!allowed(
+            "UPDATE orders SET total = (SELECT max(x) FROM secrets)"
+        ));
+        assert!(!allowed("DELETE FROM customers WHERE id = 1"));
+        assert!(!allowed("SELECT * FROM orders; DELETE FROM customers"));
+        // SQL that can't be analyzed has no context.sql.
+        assert_decision(
+            &engine,
+            run_query(json!("DROP TABLE orders")),
+            Decision::Denied,
+            "tool trusted-tools/RunQuery not permitted by any Dogwood policy",
+        );
+        assert!(!allowed("SELEC * FROM orders"));
+        // A list of queries is combined.
+        assert!(
+            verify(
+                &engine,
+                run_query(json!(["SELECT * FROM customers", "DELETE FROM orders"]))
+            )
+            .allowed()
+        );
+        assert!(
+            !verify(
+                &engine,
+                run_query(json!(["SELECT * FROM orders", "SELECT * FROM secrets"]))
+            )
+            .allowed()
+        );
+        assert!(!verify(&engine, run_query(json!(5))).allowed());
+        assert!(
+            !verify(
+                &engine,
+                json!([call("trusted-tools/RunQuery", vec![value_param(json!({}))])])
+            )
+            .allowed()
+        );
+    }
+
+    #[test]
+    fn sql_access_in_context() {
+        let store = TempStore::new();
+        let engine = store.open(EXAMPLE_POLICY);
+        let caller = Caller::parse(&json!({"caller": caller("r1")}));
+        let mut input = EventInput::new(
+            &caller,
+            &[value_param(
+                json!({"query": "INSERT INTO orders SELECT * FROM customers"}),
+            )],
+        )
+        .unwrap();
+        engine.add_sql("trusted-tools/RunQuery", &mut input);
+        assert_eq!(
+            input.json["sql"],
+            json!({"reads": ["customers"], "writes": ["orders"]})
+        );
+        // Not for an action without @sql.
+        let mut input = EventInput::new(&caller, &[value_param(json!("hi"))]).unwrap();
+        engine.add_sql("echo/echo/Echo", &mut input);
+        assert!(input.json.get("sql").is_none());
     }
 
     #[test]

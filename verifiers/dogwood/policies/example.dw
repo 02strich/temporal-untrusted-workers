@@ -62,3 +62,21 @@ when temporal {
     input.arg0.refundId: context.input.arg0
   }
 };
+
+// RunQuery may read the customers and orders tables...
+@id("run-query-read-customers-orders")
+permit (principal, action == Temporal::Action::"trusted-tools/RunQuery", resource)
+when {
+  context has sql &&
+  context.sql.writes.isEmpty() &&
+  ["customers", "orders"].containsAll(context.sql.reads)
+};
+
+// ...and write the orders table (reading customers and orders as it does).
+@id("run-query-write-orders")
+permit (principal, action == Temporal::Action::"trusted-tools/RunQuery", resource)
+when {
+  context has sql &&
+  ["orders"].containsAll(context.sql.writes) &&
+  ["customers", "orders"].containsAll(context.sql.reads)
+};

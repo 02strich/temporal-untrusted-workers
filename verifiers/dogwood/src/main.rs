@@ -6,6 +6,7 @@
 //! input events in a durable Dogwood store and decides tool calls.
 
 mod engine;
+mod sql;
 
 use std::path::PathBuf;
 

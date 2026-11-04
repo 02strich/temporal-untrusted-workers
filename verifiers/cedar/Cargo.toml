@@ -8,9 +8,7 @@ description = "temporal-proxy tool-call verifier Nexus service backed by Cedar p
 
 [dependencies]
 anyhow.workspace = true
-# Pinned to the cedar-policy-core version dogwood-language pins (=4.11.0), so
-# both verifiers share one workspace and lockfile.
-cedar-policy = "=4.11.0"
+cedar-policy.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

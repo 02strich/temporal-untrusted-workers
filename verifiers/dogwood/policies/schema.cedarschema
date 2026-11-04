@@ -18,6 +18,8 @@
 //   input.argN            parameter N: a plain JSON value as itself, an
 //                         object (or a protobuf message) as a record
 //   caller                the calling workflow run (see Caller)
+//   sql                   only for an action annotated @sql (below): the tables
+//                         its SQL reads and writes (see SqlAccess)
 // Each event action must be declared here with the shape of its parameters.
 // Events of undeclared actions are still recorded, but no policy can refer to
 // them, and a tool call of an undeclared action is denied.
@@ -40,6 +42,16 @@ namespace Temporal {
   // A tool taking a single plain JSON string, e.g. an SDK call with one
   // string argument.
   type StringInput = { parameterCount: Long, arg0?: String };
+
+  // The tables a tool call's SQL reads and writes, for an action annotated
+  // @sql("<path>[, <path>...]"): each path, under context.input, names a SQL
+  // string or a list of them, e.g. @sql("arg0.query"). All of a call's
+  // queries are combined. Only SELECT, INSERT, UPDATE and DELETE are
+  // understood; if any query is anything else, doesn't parse, or is missing,
+  // the call has no `sql`, so a policy requiring it doesn't hold.
+  // Tables are named as written, unquoted identifiers lowercased:
+  // "public.orders" is not "orders".
+  type SqlAccess = { reads: Set<String>, writes: Set<String> };
 
   // payments/billing/Charge takes one JSON object.
   type ChargeInput = {
@@ -65,6 +77,17 @@ namespace Temporal {
   action "trusted-tools/IssueRefund" appliesTo {
     principal: [Worker], resource: [TaskQueue],
     context: { input: StringInput, caller: Caller },
+  };
+
+  // trusted-tools/RunQuery runs the SQL query in its one JSON object.
+  @sql("arg0.query")
+  action "trusted-tools/RunQuery" appliesTo {
+    principal: [Worker], resource: [TaskQueue],
+    context: {
+      input: { parameterCount: Long, arg0?: { query?: String } },
+      caller: Caller,
+      sql?: SqlAccess,
+    },
   };
 
   // The demo's ToolWorkflow takes one JSON object.
